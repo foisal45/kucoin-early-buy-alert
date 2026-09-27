@@ -5,9 +5,9 @@ import threading
 import websocket
 import requests
 
-# =========================
+# ============================================================
 # CONFIG
-# =========================
+# ============================================================
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -18,16 +18,18 @@ MIN_BUY_USD = 400
 WINDOW_SECONDS = 120
 MAX_ABOVE_LOW = 15
 
-# Same coin alert cooldown
-ALERT_COOLDOWN = 600  # 10 minutes
+# Same coin will not alert again within this period
+ALERT_COOLDOWN = 600
 
-# Cache 24h stats
+# How often we refresh 24h stats for a symbol
 STATS_CACHE_SECONDS = 10
 
+# KuCoin allows up to 100 symbols per /market/match topic
+BATCH_SIZE = 100
 
-# =========================
+# ============================================================
 # MEMORY
-# =========================
+# ============================================================
 
 buy_history = {}
 last_alert = {}
@@ -35,16 +37,14 @@ stats_cache = {}
 
 session = requests.Session()
 
-
-# =========================
+# ============================================================
 # TELEGRAM
-# =========================
+# ============================================================
 
 def send_telegram(message):
-
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Telegram credentials missing.")
-        return
+        print("ERROR: Telegram credentials are missing.")
+        return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
@@ -58,29 +58,34 @@ def send_telegram(message):
             timeout=10
         )
 
-        if not response.ok:
-            print("Telegram error:", response.text)
+        if response.ok:
+            print("Telegram alert sent.")
+            return True
+
+        print("Telegram error:", response.text)
+        return False
 
     except Exception as e:
         print("Telegram exception:", e)
+        return False
 
 
-# =========================
-# GET SYMBOLS
-# =========================
+# ============================================================
+# GET ALL USDT SYMBOLS
+# ============================================================
 
 def get_symbols():
-
     url = f"{KUCOIN_API}/api/v2/symbols"
 
     try:
         response = session.get(url, timeout=15)
+        response.raise_for_status()
+
         data = response.json()
 
         symbols = []
 
         for item in data.get("data", []):
-
             if (
                 item.get("quoteCurrency") == "USDT"
                 and item.get("enableTrading") is True
@@ -90,26 +95,24 @@ def get_symbols():
                 if symbol:
                     symbols.append(symbol)
 
-        print(f"Found {len(symbols)} USDT pairs.")
+        symbols.sort()
+
+        print(f"Found {len(symbols)} USDT trading pairs.")
 
         return symbols
 
     except Exception as e:
-
-        print("Symbol error:", e)
-
+        print("Symbol API error:", e)
         return []
 
 
-# =========================
-# 24H STATS
-# =========================
+# ============================================================
+# GET 24H STATS
+# ============================================================
 
 def get_24h_stats(symbol):
-
     now = time.time()
 
-    # Use cache
     cached = stats_cache.get(symbol)
 
     if cached:
@@ -119,21 +122,28 @@ def get_24h_stats(symbol):
     url = f"{KUCOIN_API}/api/v1/market/stats"
 
     try:
-
         response = session.get(
             url,
             params={"symbol": symbol},
             timeout=8
         )
 
+        response.raise_for_status()
+
         data = response.json().get("data")
 
         if not data:
             return None
 
+        last_price = float(data.get("last", 0))
+        low_price = float(data.get("lowPrice", 0))
+
+        if last_price <= 0 or low_price <= 0:
+            return None
+
         result = {
-            "price": float(data["last"]),
-            "low": float(data["lowPrice"])
+            "price": last_price,
+            "low": low_price
         }
 
         stats_cache[symbol] = {
@@ -144,24 +154,21 @@ def get_24h_stats(symbol):
         return result
 
     except Exception as e:
-
-        print(f"Stats error {symbol}:", e)
-
+        print(f"Stats error [{symbol}]:", e)
         return None
 
 
-# =========================
-# PROCESS BUY
-# =========================
+# ============================================================
+# PROCESS BUY TRADE
+# ============================================================
 
 def process_trade(symbol, price, size, side):
-
-    if side != "buy":
+    if side.lower() != "buy":
         return
 
     usd_value = price * size
 
-    # Minimum individual buy
+    # Individual large buy threshold
     if usd_value < MIN_BUY_USD:
         return
 
@@ -178,7 +185,7 @@ def process_trade(symbol, price, size, side):
 
     above_low = ((current_price - low) / low) * 100
 
-    # Only monitor within 15% above 24h low
+    # Ignore coins more than +15% above 24h low
     if above_low > MAX_ABOVE_LOW:
         return
 
@@ -188,35 +195,38 @@ def process_trade(symbol, price, size, side):
     if symbol not in buy_history:
         buy_history[symbol] = []
 
+    # Add this large buy
     buy_history[symbol].append({
         "time": now,
         "usd": usd_value
     })
 
-    # Remove old trades
+    # Remove old buys outside the 120-second window
     buy_history[symbol] = [
-        x for x in buy_history[symbol]
-        if now - x["time"] <= WINDOW_SECONDS
+        item
+        for item in buy_history[symbol]
+        if now - item["time"] <= WINDOW_SECONDS
     ]
 
     recent_buys = buy_history[symbol]
 
-    # Need at least 2 large buys
+    # Need at least 2 large buys in the window
     if len(recent_buys) < 2:
         return
 
-    # Cooldown
+    # Prevent repeated alerts
     if symbol in last_alert:
-
         if now - last_alert[symbol] < ALERT_COOLDOWN:
             return
 
     total_buy = sum(
-        x["usd"] for x in recent_buys
+        item["usd"]
+        for item in recent_buys
     )
 
     largest_buy = max(
-        x["usd"] for x in recent_buys
+        item["usd"]
+        for item in recent_buys
     )
 
     message = (
@@ -231,27 +241,29 @@ def process_trade(symbol, price, size, side):
         f"${total_buy:,.0f}"
     )
 
-    send_telegram(message)
+    print("\n" + message + "\n")
 
-    print(message)
+    sent = send_telegram(message)
 
-    last_alert[symbol] = now
+    if sent:
+        last_alert[symbol] = now
 
-    # Reset after alert
-    buy_history[symbol] = []
+        # Reset after successful alert
+        buy_history[symbol] = []
 
 
-# =========================
+# ============================================================
 # WEBSOCKET MESSAGE
-# =========================
+# ============================================================
 
 def on_message(ws, message):
-
     try:
-
         data = json.loads(message)
 
-        if data.get("type") != "message":
+        message_type = data.get("type")
+
+        # Ignore welcome / ack / other messages
+        if message_type != "message":
             return
 
         topic = data.get("topic", "")
@@ -263,64 +275,49 @@ def on_message(ws, message):
 
         trade = data.get("data", {})
 
-        price = float(
-            trade.get("price", 0)
+        price = float(trade.get("price", 0))
+        size = float(trade.get("size", 0))
+        side = str(trade.get("side", "")).lower()
+
+        if price <= 0 or size <= 0:
+            return
+
+        process_trade(
+            symbol=symbol,
+            price=price,
+            size=size,
+            side=side
         )
-
-        size = float(
-            trade.get("size", 0)
-        )
-
-        side = trade.get(
-            "side", ""
-        ).lower()
-
-        if price > 0 and size > 0:
-
-            process_trade(
-                symbol,
-                price,
-                size,
-                side
-            )
 
     except Exception as e:
+        print("Message processing error:", e)
 
-        print("Message error:", e)
 
-
-# =========================
+# ============================================================
 # WEBSOCKET ERROR
-# =========================
+# ============================================================
 
 def on_error(ws, error):
-
     print("WebSocket error:", error)
 
 
-# =========================
+# ============================================================
 # WEBSOCKET CLOSE
-# =========================
+# ============================================================
 
-def on_close(
-    ws,
-    close_status_code,
-    close_msg
-):
-
+def on_close(ws, close_status_code, close_msg):
     print(
-        "WebSocket closed:",
-        close_status_code,
-        close_msg
+        "WebSocket closed.",
+        "Code:", close_status_code,
+        "Message:", close_msg
     )
 
 
-# =========================
-# WEBSOCKET TOKEN
-# =========================
+# ============================================================
+# GET KUCOIN PUBLIC WEBSOCKET TOKEN
+# ============================================================
 
 def get_ws_token():
-
     url = f"{KUCOIN_API}/api/v1/bullet-public"
 
     response = session.post(
@@ -328,116 +325,175 @@ def get_ws_token():
         timeout=15
     )
 
-    data = response.json()["data"]
+    response.raise_for_status()
 
-    return (
-        data["token"],
-        data["instanceServers"][0]
+    result = response.json()
+
+    if result.get("code") != "200000":
+        raise RuntimeError(
+            f"KuCoin token error: {result}"
+        )
+
+    data = result["data"]
+
+    token = data["token"]
+    server = data["instanceServers"][0]
+
+    return token, server
+
+
+# ============================================================
+# SUBSCRIBE TO SYMBOL BATCH
+# ============================================================
+
+def subscribe_batch(ws, symbols):
+    topic_symbols = ",".join(symbols)
+
+    subscribe = {
+        "id": str(int(time.time() * 1000)),
+        "type": "subscribe",
+        "topic": f"/market/match:{topic_symbols}",
+        "privateChannel": False,
+        "response": True
+    }
+
+    ws.send(json.dumps(subscribe))
+
+    print(
+        f"Subscribed to {len(symbols)} symbols."
     )
 
 
-# =========================
-# START WEBSOCKET
-# =========================
+# ============================================================
+# START ONE WEBSOCKET CONNECTION
+# ============================================================
 
 def run_websocket():
-
     symbols = get_symbols()
 
     if not symbols:
-
-        print("No symbols found.")
-
-        time.sleep(30)
-
+        print("No USDT symbols found.")
         return
 
-    try:
+    token, server = get_ws_token()
 
-        token, server = get_ws_token()
+    endpoint = server["endpoint"]
+    ping_interval_ms = server.get(
+        "pingInterval",
+        18000
+    )
 
-        ws_url = (
-            f"{server['endpoint']}?"
-            f"token={token}"
-            f"&connectId=earlybuy"
-        )
+    # KuCoin recommends client ping based on pingInterval.
+    ping_seconds = max(
+        5,
+        int(ping_interval_ms / 1000) - 2
+    )
 
-        print(
-            f"Connecting WebSocket "
-            f"for {len(symbols)} symbols..."
-        )
+    ws_url = (
+        f"{endpoint}"
+        f"?token={token}"
+        f"&connectId=earlybuy"
+    )
 
-        ws = websocket.WebSocketApp(
-            ws_url,
-            on_message=on_message,
-            on_error=on_error,
-            on_close=on_close
-        )
+    print("Connecting to KuCoin WebSocket...")
+    print(f"Ping interval: {ping_seconds}s")
 
-        def on_open(ws):
+    ws = websocket.WebSocketApp(
+        ws_url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
 
-            print("WebSocket connected.")
+    def on_open(ws_connection):
+        print("WebSocket connected.")
 
-            for symbol in symbols:
+        # Subscribe in batches.
+        # KuCoin Classic Spot allows up to 100 symbols
+        # in the /market/match topic.
+        for start in range(
+            0,
+            len(symbols),
+            BATCH_SIZE
+        ):
+            batch = symbols[
+                start:start + BATCH_SIZE
+            ]
 
-                subscribe = {
-                    "id": str(
-                        int(time.time() * 1000)
-                    ),
-                    "type": "subscribe",
-                    "topic": (
-                        f"/market/match:{symbol}"
-                    ),
-                    "privateChannel": False,
-                    "response": True
-                }
+            try:
+                subscribe_batch(
+                    ws_connection,
+                    batch
+                )
 
-                try:
+                time.sleep(0.2)
 
-                    ws.send(
-                        json.dumps(subscribe)
-                    )
+            except Exception as e:
+                print(
+                    "Subscription error:",
+                    e
+                )
 
-                    time.sleep(0.02)
+        print("All subscriptions sent.")
 
-                except Exception as e:
+    ws.on_open = on_open
 
-                    print(
-                        "Subscribe error:",
-                        symbol,
-                        e
-                    )
-
-            print("All subscriptions sent.")
-
-        ws.on_open = on_open
-
-        ws.run_forever(
-            ping_interval=20,
-            ping_timeout=10
-        )
-
-    except Exception as e:
-
-        print(
-            "WebSocket connection error:",
-            e
-        )
+    # Keep connection alive.
+    ws.run_forever(
+        ping_interval=ping_seconds,
+        ping_timeout=10
+    )
 
 
-# =========================
+# ============================================================
 # MAIN LOOP
-# =========================
+# ============================================================
 
 def main():
-
     print("==============================")
-    print(" KuCoin Early Buy Detector")
+    print("  KuCoin Early Buy Detector")
     print("==============================")
 
     print(
-        f"Minimum BUY: ${MIN_BUY_USD}"
+        f"Minimum individual BUY: "
+        f"${MIN_BUY_USD}"
     )
 
     print(
-        f"Window: {WINDOW
+        f"Repeated BUY window: "
+        f"{WINDOW_SECONDS} seconds"
+    )
+
+    print(
+        f"Maximum above 24h low: "
+        f"{MAX_ABOVE_LOW}%"
+    )
+
+    print(
+        f"Alert cooldown: "
+        f"{ALERT_COOLDOWN} seconds"
+    )
+
+    while True:
+        try:
+            run_websocket()
+
+        except Exception as e:
+            print(
+                "Main WebSocket error:",
+                e
+            )
+
+        print(
+            "Reconnecting in 10 seconds..."
+        )
+
+        time.sleep(10)
+
+
+# ============================================================
+# START
+# ============================================================
+
+if __name__ == "__main__":
+    main()
