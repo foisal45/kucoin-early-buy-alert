@@ -2,6 +2,7 @@ name: KuCoin Early Buy Detector
 
 on:
   workflow_dispatch:
+
   schedule:
     - cron: "*/10 * * * *"
 
