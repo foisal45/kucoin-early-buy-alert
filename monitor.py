@@ -4,41 +4,25 @@ import time
 import requests
 from datetime import datetime, timezone
 
-# ============================================================
-# KuCoin Daily 2nd-Move / Retest Scanner
-# ============================================================
-
 KUCOIN_API = "https://api.kucoin.com"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ---------------- SETTINGS ----------------
-
 TIMEFRAME = "1day"
 
-# Strong initial move
-MIN_STRONG_MOVE = 8.0          # minimum % move of breakout candle
-MIN_BREAKOUT_ABOVE = 3.0       # breakout must beat previous resistance by %
+MIN_STRONG_MOVE = 8.0
+MIN_BREAKOUT_ABOVE = 3.0
 
-# Retest
-RETEST_DISTANCE = 3.5          # % distance from breakout zone
-MIN_PULLBACK = 4.0             # minimum pullback from post-breakout high
-MAX_PULLBACK = 35.0            # don't alert after a huge collapse
+RETEST_DISTANCE = 3.5
+MIN_PULLBACK = 4.0
+MAX_PULLBACK = 35.0
 
-# Previous resistance
 LOOKBACK = 20
-
-# Avoid very new / illiquid pairs
 MIN_PRICE = 0.000001
 MIN_VOLUME_USDT = 50000
 
-# State file
 STATE_FILE = "alert_state.json"
-
-# ============================================================
-# HTTP
-# ============================================================
 
 session = requests.Session()
 session.headers.update({
@@ -48,27 +32,24 @@ session.headers.update({
 
 def kucoin_get(path, params=None):
     try:
-        r = session.get(
+        response = session.get(
             KUCOIN_API + path,
             params=params,
             timeout=20
         )
-        r.raise_for_status()
 
-        data = r.json()
+        response.raise_for_status()
+        data = response.json()
 
         if data.get("code") != "200000":
             return None
 
         return data.get("data")
 
-    except Exception:
+    except Exception as error:
+        print(f"API error: {error}")
         return None
 
-
-# ============================================================
-# TELEGRAM
-# ============================================================
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -87,50 +68,45 @@ def send_telegram(message):
     }
 
     try:
-        r = requests.post(
+        response = requests.post(
             url,
             json=payload,
             timeout=20
         )
 
-        if r.ok:
+        if response.ok:
             print("Telegram alert sent.")
             return True
 
-        print("Telegram error:", r.text)
+        print("Telegram error:", response.text)
         return False
 
-    except Exception as e:
-        print("Telegram exception:", e)
+    except Exception as error:
+        print(f"Telegram exception: {error}")
         return False
 
-
-# ============================================================
-# STATE
-# ============================================================
 
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {}
 
     try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
+        with open(STATE_FILE, "r") as file:
+            return json.load(file)
+
+    except Exception as error:
+        print(f"State load error: {error}")
         return {}
 
 
 def save_state(state):
     try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-    except Exception as e:
-        print("State save error:", e)
+        with open(STATE_FILE, "w") as file:
+            json.dump(state, file, indent=2)
 
+    except Exception as error:
+        print(f"State save error: {error}")
 
-# ============================================================
-# SYMBOLS
-# ============================================================
 
 def get_symbols():
     data = kucoin_get("/api/v2/symbols")
@@ -141,30 +117,21 @@ def get_symbols():
     symbols = []
 
     for item in data:
-        try:
-            if item.get("quoteCurrency") != "USDT":
-                continue
-
-            if not item.get("enableTrading"):
-                continue
-
-            symbol = item.get("symbol")
-
-            if symbol:
-                symbols.append(symbol)
-
-        except Exception:
+        if item.get("quoteCurrency") != "USDT":
             continue
+
+        if not item.get("enableTrading"):
+            continue
+
+        symbol = item.get("symbol")
+
+        if symbol:
+            symbols.append(symbol)
 
     return symbols
 
 
-# ============================================================
-# DAILY CANDLES
-# ============================================================
-
 def get_daily_candles(symbol):
-
     data = kucoin_get(
         "/api/v1/market/candles",
         {
@@ -178,20 +145,16 @@ def get_daily_candles(symbol):
 
     candles = []
 
-    for c in data:
-
+    for candle in data:
         try:
-            # KuCoin:
-            # [time, open, close, high, low, volume, turnover]
-
             candles.append({
-                "time": int(c[0]),
-                "open": float(c[1]),
-                "close": float(c[2]),
-                "high": float(c[3]),
-                "low": float(c[4]),
-                "volume": float(c[5]),
-                "turnover": float(c[6])
+                "time": int(candle[0]),
+                "open": float(candle[1]),
+                "close": float(candle[2]),
+                "high": float(candle[3]),
+                "low": float(candle[4]),
+                "volume": float(candle[5]),
+                "turnover": float(candle[6])
             })
 
         except Exception:
@@ -202,12 +165,7 @@ def get_daily_candles(symbol):
     return candles
 
 
-# ============================================================
-# CURRENT PRICE
-# ============================================================
-
 def get_current_price(symbol):
-
     data = kucoin_get(
         "/api/v1/market/orderbook/level1",
         {
@@ -220,15 +178,87 @@ def get_current_price(symbol):
 
     try:
         return float(data["price"])
+
     except Exception:
         return None
 
 
-# ============================================================
-# DETECT SETUP
-# ============================================================
-
 def detect_retest(symbol, candles, current_price):
 
     if len(candles) < LOOKBACK + 10:
-       
+        return None
+
+    # Ignore currently forming daily candle
+    completed = candles[:-1]
+
+    if len(completed) < LOOKBACK + 8:
+        return None
+
+    candidates = []
+
+    start = max(
+        LOOKBACK,
+        len(completed) - 25
+    )
+
+    for index in range(
+        start,
+        len(completed) - 3
+    ):
+
+        candle = completed[index]
+
+        previous = completed[
+            index - LOOKBACK:index
+        ]
+
+        previous_high = max(
+            item["high"] for item in previous
+        )
+
+        if previous_high <= 0:
+            continue
+
+        breakout_strength = (
+            (candle["close"] - previous_high)
+            / previous_high
+        ) * 100
+
+        candle_move = (
+            (candle["close"] - candle["open"])
+            / candle["open"]
+        ) * 100
+
+        if breakout_strength < MIN_BREAKOUT_ABOVE:
+            continue
+
+        if candle_move < MIN_STRONG_MOVE:
+            continue
+
+        if candle["turnover"] < MIN_VOLUME_USDT:
+            continue
+
+        candidates.append({
+            "index": index,
+            "breakout": candle,
+            "zone": previous_high
+        })
+
+    if not candidates:
+        return None
+
+    setup = candidates[-1]
+
+    breakout_index = setup["index"]
+    breakout_candle = setup["breakout"]
+    breakout_zone = setup["zone"]
+
+    after_breakout = completed[
+        breakout_index + 1:
+    ]
+
+    if len(after_breakout) < 2:
+        return None
+
+    post_breakout_high = max(
+        item["
