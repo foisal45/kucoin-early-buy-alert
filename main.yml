@@ -1,10 +1,10 @@
-name: KuCoin Early Buy Detector
+name: KuCoin Daily 2nd-Move Retest Scanner
 
 on:
   workflow_dispatch:
 
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "*/30 * * * *"
 
 jobs:
   monitor:
@@ -22,7 +22,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run detector
+      - name: Run Daily Retest Scanner
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
