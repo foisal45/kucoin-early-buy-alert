@@ -1,83 +1,49 @@
 import os
 import json
-import time
 import requests
 from datetime import datetime, timezone
 
 API = "https://api.kucoin.com"
-
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
-
 STATE_FILE = "alert_state.json"
 
-LOOKBACK = 20
-MIN_DAILY_MOVE = 8.0
-MIN_BREAKOUT = 3.0
-MIN_PULLBACK = 4.0
-MAX_PULLBACK = 35.0
-RETEST_DISTANCE = 4.0
-MIN_TURNOVER = 50000
-
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "KuCoin-Daily-Retest-Scanner"
-})
 
 
-def api_get(path, params=None):
+def get(path, params=None):
     try:
-        r = session.get(
-            API + path,
-            params=params,
-            timeout=20
-        )
-        r.raise_for_status()
-
+        r = session.get(API + path, params=params, timeout=15)
         data = r.json()
 
-        if data.get("code") != "200000":
-            return None
-
-        return data.get("data")
+        if data.get("code") == "200000":
+            return data.get("data")
 
     except Exception as e:
         print("API error:", e)
-        return None
+
+    return None
 
 
-def send_telegram(text):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("Telegram secrets are missing.")
+def telegram(message):
+    if not TOKEN or not CHAT_ID:
         return False
 
-    url = (
-        "https://api.telegram.org/bot"
-        + TELEGRAM_TOKEN
-        + "/sendMessage"
-    )
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": text
-    }
+    url = "https://api.telegram.org/bot" + TOKEN + "/sendMessage"
 
     try:
         r = requests.post(
             url,
-            json=payload,
-            timeout=20
+            json={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
+            timeout=15
         )
 
-        if r.ok:
-            print("Telegram alert sent.")
-            return True
+        return r.ok
 
-        print("Telegram error:", r.text)
-        return False
-
-    except Exception as e:
-        print("Telegram error:", e)
+    except Exception:
         return False
 
 
@@ -88,29 +54,38 @@ def load_state():
     try:
         with open(STATE_FILE, "r") as f:
             return json.load(f)
-
     except Exception:
         return {}
 
 
 def save_state(state):
-    try:
-        with open(STATE_FILE, "w") as f:
-            json.dump(state, f, indent=2)
-
-    except Exception as e:
-        print("State save error:", e)
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
 
 
-def get_symbols():
-    data = api_get("/api/v2/symbols")
+def price_text(p):
+    if p >= 100:
+        return "{:.2f}".format(p)
+    if p >= 1:
+        return "{:.4f}".format(p)
+    if p >= 0.01:
+        return "{:.6f}".format(p)
+    return "{:.10f}".format(p)
 
-    if not data:
-        return []
 
-    result = []
+def main():
 
-    for item in data:
+    print("KUCOIN 50% MOVE / 24H LOW RETEST SCANNER")
+
+    state = load_state()
+
+    symbols = get("/api/v2/symbols")
+
+    if not symbols:
+        print("No symbols found.")
+        return
+
+    for item in symbols:
 
         if item.get("quoteCurrency") != "USDT":
             continue
@@ -120,346 +95,76 @@ def get_symbols():
 
         symbol = item.get("symbol")
 
-        if symbol:
-            result.append(symbol)
+        if not symbol:
+            continue
 
-    return result
+        ticker = get(
+            "/api/v1/market/stats",
+            {"symbol": symbol}
+        )
 
-
-def get_daily_candles(symbol):
-    data = api_get(
-        "/api/v1/market/candles",
-        {
-            "symbol": symbol,
-            "type": "1day"
-        }
-    )
-
-    if not data:
-        return []
-
-    result = []
-
-    for row in data:
+        if not ticker:
+            continue
 
         try:
-            result.append({
-                "time": int(row[0]),
-                "open": float(row[1]),
-                "close": float(row[2]),
-                "high": float(row[3]),
-                "low": float(row[4]),
-                "volume": float(row[5]),
-                "turnover": float(row[6])
-            })
-
+            current = float(ticker["last"])
+            low24 = float(ticker["low"])
+            high24 = float(ticker["high"])
         except Exception:
             continue
 
-    result.sort(key=lambda x: x["time"])
+        if low24 <= 0:
+            continue
 
-    return result
+        above_low = ((current - low24) / low24) * 100
+        previous_move = ((high24 - low24) / low24) * 100
 
+        # Must have moved at least 50% from 24H low
+        if previous_move < 50:
+            continue
 
-def get_current_price(symbol):
-    data = api_get(
-        "/api/v1/market/orderbook/level1",
-        {
-            "symbol": symbol
-        }
-    )
+        # Alert when price comes back to +10% or below
+        if above_low > 10:
+            continue
 
-    if not data:
-        return None
+        setup_id = symbol + "_" + str(round(low24, 12))
 
-    try:
-        return float(data["price"])
+        if setup_id in state:
+            continue
 
-    except Exception:
-        return None
-
-
-def find_setup(symbol, candles, current_price):
-
-    if len(candles) < LOOKBACK + 10:
-        return None
-
-    completed = candles[:-1]
-
-    if len(completed) < LOOKBACK + 8:
-        return None
-
-    candidates = []
-
-    start = max(
-        LOOKBACK,
-        len(completed) - 30
-    )
-
-    for i in range(start, len(completed) - 3):
-
-        candle = completed[i]
-
-        previous = completed[i - LOOKBACK:i]
-
-        previous_high = max(
-            x["high"] for x in previous
+        message = (
+            "🟢 2ND-MOVE RETEST ALERT\n\n"
+            "🪙 " + symbol + "\n"
+            "💰 Current Price: " + price_text(current) + "\n"
+            "📉 24H Low: " + price_text(low24) + "\n"
+            "📊 Above 24H Low: "
+            + "{:.2f}".format(above_low)
+            + "%\n\n"
+            "🚀 Previous 24H Move: +"
+            + "{:.1f}".format(previous_move)
+            + "%\n"
+            "📈 24H High: " + price_text(high24) + "\n\n"
+            "🔄 Strong move → Retrace → Near 24H Low\n"
+            "🎯 Price is now at or below +10% from 24H Low\n\n"
+            "⚠️ Check chart before entry."
         )
 
-        if previous_high <= 0:
-            continue
+        if telegram(message):
 
-        daily_move = (
-            (candle["close"] - candle["open"])
-            / candle["open"]
-        ) * 100
+            state[setup_id] = {
+                "symbol": symbol,
+                "low": low24,
+                "alerted_at": datetime.now(
+                    timezone.utc
+                ).isoformat()
+            }
 
-        breakout = (
-            (candle["close"] - previous_high)
-            / previous_high
-        ) * 100
+            save_state(state)
 
-        if daily_move < MIN_DAILY_MOVE:
-            continue
-
-        if breakout < MIN_BREAKOUT:
-            continue
-
-        if candle["turnover"] < MIN_TURNOVER:
-            continue
-
-        candidates.append({
-            "index": i,
-            "zone": previous_high,
-            "candle": candle
-        })
-
-    if not candidates:
-        return None
-
-    setup = candidates[-1]
-
-    breakout_index = setup["index"]
-    zone = setup["zone"]
-    breakout_candle = setup["candle"]
-
-    after = completed[breakout_index + 1:]
-
-    if len(after) < 2:
-        return None
-
-    post_high = max(
-        x["high"] for x in after
-    )
-
-    if post_high <= zone:
-        return None
-
-    pullback = (
-        (post_high - current_price)
-        / post_high
-    ) * 100
-
-    if pullback < MIN_PULLBACK:
-        return None
-
-    if pullback > MAX_PULLBACK:
-        return None
-
-    distance = (
-        (current_price - zone)
-        / zone
-    ) * 100
-
-    if abs(distance) > RETEST_DISTANCE:
-        return None
-
-    moved_away = False
-
-    for candle in after:
-
-        if candle["high"] >= zone * 1.08:
-            moved_away = True
-            break
-
-    if not moved_away:
-        return None
-
-    touched = False
-
-    for candle in completed[-5:]:
-
-        if (
-            candle["low"] <= zone * 1.04
-            and candle["high"] >= zone * 0.96
-        ):
-            touched = True
-            break
-
-    if not touched:
-        return None
-
-    if current_price < zone * 0.96:
-        return None
-
-    daily_move = (
-        (breakout_candle["close"] - breakout_candle["open"])
-        / breakout_candle["open"]
-    ) * 100
-
-    breakout = (
-        (breakout_candle["close"] - zone)
-        / zone
-    ) * 100
-
-    breakout_date = datetime.fromtimestamp(
-        breakout_candle["time"],
-        tz=timezone.utc
-    ).strftime("%Y-%m-%d")
-
-    return {
-        "symbol": symbol,
-        "price": current_price,
-        "zone": zone,
-        "post_high": post_high,
-        "pullback": pullback,
-        "distance": distance,
-        "daily_move": daily_move,
-        "breakout": breakout,
-        "date": breakout_date
-    }
-
-
-def format_price(price):
-
-    if price >= 100:
-        return "{:.2f}".format(price)
-
-    if price >= 1:
-        return "{:.4f}".format(price)
-
-    if price >= 0.01:
-        return "{:.6f}".format(price)
-
-    if price >= 0.0001:
-        return "{:.8f}".format(price)
-
-    return "{:.10f}".format(price)
-
-
-def main():
-
-    print("========================================")
-    print("KUCOIN DAILY 2ND-MOVE RETEST SCANNER")
-    print("========================================")
-
-    state = load_state()
-
-    symbols = get_symbols()
-
-    print("USDT pairs:", len(symbols))
-
-    alerts = 0
-
-    for symbol in symbols:
-
-        try:
-
-            candles = get_daily_candles(symbol)
-
-            if not candles:
-                continue
-
-            price = get_current_price(symbol)
-
-            if not price:
-                continue
-
-            setup = find_setup(
-                symbol,
-                candles,
-                price
-            )
-
-            if not setup:
-                continue
-
-            setup_id = (
-                symbol
-                + "_"
-                + setup["date"]
-                + "_"
-                + str(round(setup["zone"], 10))
-            )
-
-            if setup_id in state:
-                continue
-
-            message = (
-                "KUCOIN 2ND-MOVE SETUP\n"
-                "\n"
-                "Coin: " + setup["symbol"] + "\n"
-                "Current Price: " + format_price(setup["price"]) + "\n"
-                "\n"
-                "Previous Daily Move: +"
-                + "{:.1f}".format(setup["daily_move"])
-                + "%\n"
-                "Breakout: +"
-                + "{:.1f}".format(setup["breakout"])
-                + "%\n"
-                "Breakout Date: "
-                + setup["date"]
-                + "\n"
-                "\n"
-                "Retest Zone: "
-                + format_price(setup["zone"])
-                + "\n"
-                "Distance From Zone: "
-                + "{:+.2f}".format(setup["distance"])
-                + "%\n"
-                "Pullback From High: "
-                + "{:.1f}".format(setup["pullback"])
-                + "%\n"
-                "Previous High: "
-                + format_price(setup["post_high"])
-                + "\n"
-                "\n"
-                "Setup: Previous breakout/support zone "
-                "is being retested after a strong Daily move.\n"
-                "\n"
-                "Wait for confirmation before entry."
-            )
-
-            if send_telegram(message):
-
-                state[setup_id] = {
-                    "symbol": symbol,
-                    "date": setup["date"],
-                    "alerted_at": datetime.now(
-                        timezone.utc
-                    ).isoformat()
-                }
-
-                save_state(state)
-
-                alerts += 1
-
-            time.sleep(0.15)
-
-        except Exception as e:
-
-            print(
-                "Error:",
-                symbol,
-                e
-            )
+            print("ALERT:", symbol)
 
     save_state(state)
-
-    print("========================================")
     print("Scan completed.")
-    print("Alerts:", alerts)
-    print("========================================")
 
 
 if __name__ == "__main__":
