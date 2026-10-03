@@ -1,35 +1,40 @@
 import os
 import time
 import requests
-
-
-# =========================================================
-# CONFIG
-# =========================================================
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 KUCOIN_API = "https://api.kucoin.com"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# ---- Setup rules ----
+# =========================================================
+# SETTINGS
+# =========================================================
 
-# Coin must first make at least this much move from 24H low
-MIN_FIRST_MOVE = 20.0
+# Deposit OFF = highest priority
+CHECK_DEPOSIT_OFF = True
 
-# Price must come back within +15% of 24H low
-MAX_ABOVE_LOW = 15.0
-
-# Price must retrace at least 15% from the pump high
-MIN_RETRACE = 15.0
-
-# Exclude newly listed coins
+# Existing coins only
 MIN_LISTED_DAYS = 30
 
-# Buy activity:
-# Current 15M candle should be green and volume should be
-# higher than the average of previous candles.
+# Market cap:
+# Ultra-micro: < $1M
+# Micro:       $1M - $100M
+# Mid/High:    >= $100M -> excluded
+MAX_MARKET_CAP = 100_000_000
+
+# Fresh same-day setup
+MIN_FIRST_MOVE = 20.0
+MIN_RETRACE = 15.0
+MAX_ABOVE_LOW = 15.0
+
+# Buying activity confirmation
 VOLUME_MULTIPLIER = 1.20
+
+# Bangladesh day
+BD_TZ = ZoneInfo("Asia/Dhaka")
 
 
 # =========================================================
@@ -38,74 +43,65 @@ VOLUME_MULTIPLIER = 1.20
 
 def send_telegram(message):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("ERROR: TELEGRAM_TOKEN or CHAT_ID missing.")
-        return
+        print("Telegram secrets missing.")
+        return False
 
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message
-    }
 
     try:
         r = requests.post(
             url,
-            json=payload,
+            json={
+                "chat_id": CHAT_ID,
+                "text": message
+            },
             timeout=15
         )
 
         print("Telegram:", r.status_code)
 
-        if r.status_code != 200:
-            print(r.text)
+        return r.status_code == 200
 
     except Exception as e:
         print("Telegram error:", e)
+        return False
 
 
 # =========================================================
-# GET EXISTING KUCOIN COINS
+# KUCOIN SYMBOLS
 # =========================================================
 
 def get_symbols():
+
     url = f"{KUCOIN_API}/api/v2/symbols"
 
     try:
         r = requests.get(url, timeout=20)
         r.raise_for_status()
-
         data = r.json().get("data", [])
-
     except Exception as e:
-        print("Symbol API error:", e)
+        print("Symbol error:", e)
         return []
 
     now_ms = int(time.time() * 1000)
 
-    symbols = []
+    result = []
 
-    for item in data:
+    for x in data:
 
         try:
-            symbol = item.get("symbol")
+            symbol = x["symbol"]
 
-            # Only USDT spot
-            if item.get("quoteCurrency") != "USDT":
+            if x.get("quoteCurrency") != "USDT":
                 continue
 
-            # Must be tradable
-            if not item.get("enableTrading"):
+            if not x.get("enableTrading"):
                 continue
 
-            # -------------------------------------------------
-            # Exclude newly listed coins
-            # -------------------------------------------------
-
-            list_at = item.get("listAt")
+            # New listing বাদ
+            list_at = x.get("listAt")
 
             if list_at:
-
                 age_days = (
                     now_ms - int(list_at)
                 ) / 1000 / 86400
@@ -113,32 +109,209 @@ def get_symbols():
                 if age_days < MIN_LISTED_DAYS:
                     continue
 
-            symbols.append(symbol)
+            result.append({
+                "symbol": symbol,
+                "base": x.get("baseCurrency", "")
+            })
 
         except Exception:
             continue
 
-    print(f"Existing USDT coins: {len(symbols)}")
+    print("Eligible existing coins:", len(result))
 
-    return symbols
+    return result
 
 
 # =========================================================
-# 15 MIN CANDLES
+# KUCOIN DEPOSIT STATUS
 # =========================================================
 
-def get_candles(symbol):
+def get_deposit_status():
 
-    end = int(time.time())
-    start = end - (24 * 60 * 60)
+    url = f"{KUCOIN_API}/api/v3/currencies"
+
+    try:
+        r = requests.get(url, timeout=20)
+        r.raise_for_status()
+
+        data = r.json().get("data", [])
+
+        result = {}
+
+        for coin in data:
+
+            currency = coin.get("currency")
+
+            chains = coin.get("chains") or []
+
+            if not currency:
+                continue
+
+            # True = at least one network deposit ON
+            deposit_on = False
+
+            for chain in chains:
+
+                if chain.get("isDepositEnabled") is True:
+                    deposit_on = True
+                    break
+
+            result[currency.upper()] = deposit_on
+
+        return result
+
+    except Exception as e:
+        print("Deposit API error:", e)
+        return {}
+
+
+def check_deposit_off():
+
+    status = get_deposit_status()
+
+    if not status:
+        return
+
+    alerts = []
+
+    for coin, deposit_on in status.items():
+
+        if not deposit_on:
+
+            # Deposit OFF
+            alerts.append(coin)
+
+    if not alerts:
+        print("No deposit OFF detected.")
+        return
+
+    # Only coins currently in KuCoin market universe
+    symbols = get_symbols()
+
+    market_bases = {
+        x["base"].upper()
+        for x in symbols
+    }
+
+    for coin in alerts:
+
+        if coin not in market_bases:
+            continue
+
+        message = (
+            "🚨 KUCOIN DEPOSIT OFF\n\n"
+            f"🪙 {coin}\n"
+            "⛔ Deposit: OFF\n\n"
+            "🔥 HIGH PRIORITY"
+        )
+
+        print(message)
+
+        send_telegram(message)
+
+
+# =========================================================
+# MARKET CAP
+# =========================================================
+
+def get_market_caps():
+
+    """
+    CoinGecko public API.
+    Used only to classify:
+    Ultra-micro / Micro / Mid / High.
+    """
+
+    caps = {}
+
+    for page in range(1, 5):
+
+        try:
+
+            url = "https://api.coingecko.com/api/v3/coins/markets"
+
+            params = {
+                "vs_currency": "usd",
+                "order": "market_cap_desc",
+                "per_page": 250,
+                "page": page,
+                "sparkline": "false"
+            }
+
+            r = requests.get(
+                url,
+                params=params,
+                timeout=20
+            )
+
+            if r.status_code != 200:
+                print("CoinGecko:", r.status_code)
+                break
+
+            data = r.json()
+
+            if not data:
+                break
+
+            for coin in data:
+
+                symbol = (
+                    coin.get("symbol") or ""
+                ).upper()
+
+                mc = coin.get("market_cap")
+
+                if symbol and mc:
+                    caps[symbol] = mc
+
+            time.sleep(1)
+
+        except Exception as e:
+
+            print("Market cap error:", e)
+            break
+
+    print("Market cap data:", len(caps))
+
+    return caps
+
+
+# =========================================================
+# 15M CANDLES
+# =========================================================
+
+def get_15m_candles(symbol):
+
+    # Bangladesh current date
+    now_bd = datetime.now(BD_TZ)
+
+    # Start of TODAY
+    start_bd = now_bd.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0
+    )
+
+    start_utc = int(
+        start_bd.astimezone(
+            timezone.utc
+        ).timestamp()
+    )
+
+    end_utc = int(
+        datetime.now(
+            timezone.utc
+        ).timestamp()
+    )
 
     url = f"{KUCOIN_API}/api/v1/market/candles"
 
     params = {
         "symbol": symbol,
         "type": "15min",
-        "startAt": start,
-        "endAt": end
+        "startAt": start_utc,
+        "endAt": end_utc
     }
 
     try:
@@ -169,7 +342,7 @@ def get_candles(symbol):
                 })
 
             except Exception:
-                continue
+                pass
 
         candles.sort(
             key=lambda x: x["time"]
@@ -187,44 +360,103 @@ def get_candles(symbol):
 
 
 # =========================================================
-# CHECK RETEST SETUP
+# 1H CANDLES
 # =========================================================
 
-def check_setup(symbol):
+def get_1h_candles(symbol):
 
-    candles = get_candles(symbol)
+    now = int(time.time())
 
-    if len(candles) < 20:
+    start = now - 24 * 60 * 60
+
+    url = f"{KUCOIN_API}/api/v1/market/candles"
+
+    params = {
+        "symbol": symbol,
+        "type": "1hour",
+        "startAt": start,
+        "endAt": now
+    }
+
+    try:
+
+        r = requests.get(
+            url,
+            params=params,
+            timeout=15
+        )
+
+        if r.status_code != 200:
+            return []
+
+        raw = r.json().get("data", [])
+
+        candles = []
+
+        for c in raw:
+
+            try:
+                candles.append({
+                    "open": float(c[1]),
+                    "close": float(c[2]),
+                    "high": float(c[3]),
+                    "low": float(c[4])
+                })
+
+            except Exception:
+                pass
+
+        candles.sort(
+            key=lambda x: x["high"]
+        )
+
+        return candles
+
+    except Exception:
+        return []
+
+
+# =========================================================
+# FRESH SAME-DAY RETEST
+# =========================================================
+
+def check_retest(symbol, market_cap):
+
+    # Mid/high বাদ
+    if market_cap is None:
         return None
 
-    # -------------------------------------------------
-    # Use completed 15M candles
-    # -------------------------------------------------
+    if market_cap >= MAX_MARKET_CAP:
+        return None
 
-    # Current/latest candle can still be forming.
-    # Use the previous completed candle.
+    candles = get_15m_candles(symbol)
+
+    if len(candles) < 8:
+        return None
+
+    # Last completed candle
     current = candles[-2]
 
     previous = candles[:-2]
 
-    if len(previous) < 10:
+    if len(previous) < 5:
         return None
 
-    # -------------------------------------------------
-    # 24H LOW
-    # -------------------------------------------------
+    # ---------------------------------------------
+    # TODAY'S LOW
+    # ---------------------------------------------
 
-    low_24h = min(
+    today_low = min(
         c["low"]
         for c in candles
     )
 
-    if low_24h <= 0:
+    if today_low <= 0:
         return None
 
-    # -------------------------------------------------
-    # FIRST MOVE / PUMP
-    # -------------------------------------------------
+    # ---------------------------------------------
+    # TODAY'S HIGH / FIRST MOVE
+    # ---------------------------------------------
 
     peak_candle = max(
         previous,
@@ -234,18 +466,16 @@ def check_setup(symbol):
     peak = peak_candle["high"]
 
     first_move = (
-        (peak - low_24h)
-        / low_24h
+        (peak - today_low)
+        / today_low
     ) * 100
 
-    # Must have a meaningful first move
     if first_move < MIN_FIRST_MOVE:
         return None
 
-    # -------------------------------------------------
-    # IMPORTANT:
-    # Peak must happen BEFORE current candle
-    # -------------------------------------------------
+    # ---------------------------------------------
+    # PEAK MUST HAPPEN BEFORE CURRENT CANDLE
+    # ---------------------------------------------
 
     peak_index = previous.index(
         peak_candle
@@ -254,56 +484,48 @@ def check_setup(symbol):
     if peak_index >= len(previous) - 1:
         return None
 
-    # -------------------------------------------------
+    # ---------------------------------------------
     # CURRENT PRICE
-    # -------------------------------------------------
+    # ---------------------------------------------
 
-    current_price = current["close"]
+    price = current["close"]
 
     above_low = (
-        (current_price - low_24h)
-        / low_24h
+        (price - today_low)
+        / today_low
     ) * 100
 
-    # Current price must be inside
-    # 24H Low +15% zone
     if above_low < 0:
         return None
 
     if above_low > MAX_ABOVE_LOW:
         return None
 
-    # -------------------------------------------------
-    # RETRACE
-    # -------------------------------------------------
+    # ---------------------------------------------
+    # RETRACE >= 15%
+    # ---------------------------------------------
 
     retrace = (
-        (peak - current_price)
+        (peak - price)
         / peak
     ) * 100
 
     if retrace < MIN_RETRACE:
         return None
 
-    # -------------------------------------------------
+    # ---------------------------------------------
     # BUYING ACTIVITY
-    #
-    # We don't use WebSocket.
-    # Instead:
-    #
-    # 1. Current completed 15M candle is green
-    # 2. Current volume > previous average volume
-    # -------------------------------------------------
+    # ---------------------------------------------
 
     if current["close"] <= current["open"]:
         return None
 
-    volume_sample = previous[-5:]
+    sample = previous[-5:]
 
     avg_volume = sum(
         c["volume"]
-        for c in volume_sample
-    ) / len(volume_sample)
+        for c in sample
+    ) / len(sample)
 
     if avg_volume <= 0:
         return None
@@ -316,71 +538,170 @@ def check_setup(symbol):
     if volume_ratio < VOLUME_MULTIPLIER:
         return None
 
+    # ---------------------------------------------
+    # 1H CONFIRMATION
+    # ---------------------------------------------
+
+    h1 = get_1h_candles(symbol)
+
+    if len(h1) < 4:
+        return None
+
+    h1_recent = h1[-4:]
+
+    h1_high = max(
+        c["high"]
+        for c in h1_recent
+    )
+
+    h1_low = min(
+        c["low"]
+        for c in h1_recent
+    )
+
+    if h1_low <= 0:
+        return None
+
+    h1_move = (
+        (h1_high - h1_low)
+        / h1_low
+    ) * 100
+
+    # 1H-এও meaningful move থাকতে হবে
+    if h1_move < MIN_FIRST_MOVE:
+        return None
+
     return {
-        "price": current_price,
-        "low": low_24h,
+        "price": price,
+        "low": today_low,
         "first_move": first_move,
         "above_low": above_low,
+        "market_cap": market_cap,
         "volume_ratio": volume_ratio
     }
 
 
 # =========================================================
-# MAIN SCAN
+# MAIN
 # =========================================================
 
 def main():
 
     print("======================================")
-    print(" KuCoin 15M RETEST SETUP SCANNER")
+    print(" KUCOIN EARLY BUY / RETEST SCANNER")
     print("======================================")
 
     if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("Telegram secrets missing.")
+        return
 
-        print(
-            "ERROR: Telegram secrets missing."
+    # -----------------------------------------------------
+    # 1ST PRIORITY: DEPOSIT OFF
+    # -----------------------------------------------------
+
+    print("\n[1] Checking Deposit OFF...")
+
+    if CHECK_DEPOSIT_OFF:
+        check_deposit_off()
+
+    # -----------------------------------------------------
+    # Get coins
+    # -----------------------------------------------------
+
+    print("\n[2] Loading KuCoin coins...")
+
+    coins = get_symbols()
+
+    if not coins:
+        print("No coins found.")
+        return
+
+    # -----------------------------------------------------
+    # Market caps
+    # -----------------------------------------------------
+
+    print("\n[3] Loading market caps...")
+
+    market_caps = get_market_caps()
+
+    # -----------------------------------------------------
+    # Retest scan
+    # -----------------------------------------------------
+
+    print("\n[4] Scanning fresh same-day retests...")
+
+    # Micro first
+    def cap_priority(item):
+
+        mc = market_caps.get(
+            item["base"].upper()
         )
 
-        return
+        if mc is None:
+            return 999
 
-    symbols = get_symbols()
+        if mc < 1_000_000:
+            return 0       # Ultra-micro
 
-    if not symbols:
+        if mc < 100_000_000:
+            return 1       # Micro
 
-        print("No symbols found.")
-        return
+        return 99          # Mid/high
+
+    coins.sort(
+        key=cap_priority
+    )
 
     alerts = 0
 
-    for i, symbol in enumerate(symbols, 1):
+    for item in coins:
+
+        symbol = item["symbol"]
+        base = item["base"].upper()
+
+        mc = market_caps.get(base)
+
+        # Market cap unavailable হলে skip
+        if mc is None:
+            continue
+
+        # Mid/high বাদ
+        if mc >= MAX_MARKET_CAP:
+            continue
 
         try:
 
-            setup = check_setup(symbol)
+            setup = check_retest(
+                symbol,
+                mc
+            )
 
             if not setup:
                 continue
 
-            price = setup["price"]
-            low = setup["low"]
-            first_move = setup["first_move"]
-            above_low = setup["above_low"]
+            if mc < 1_000_000:
+                cap_label = "Ultra-Micro"
+            else:
+                cap_label = "Micro"
 
             message = (
                 "🚨 15M RETEST SETUP\n\n"
                 f"🪙 {symbol}\n"
-                f"📈 First Move: +{first_move:.1f}%\n\n"
-                f"📍 24H Low: {low:.8g}\n"
-                f"💰 Now: {price:.8g} "
-                f"(+{above_low:.1f}%)\n\n"
+                f"💎 {cap_label}\n"
+                f"📈 Today's Move: "
+                f"+{setup['first_move']:.1f}%\n\n"
+                f"📍 24H Low: "
+                f"{setup['low']:.8g}\n"
+                f"💰 Now: "
+                f"{setup['price']:.8g} "
+                f"(+{setup['above_low']:.1f}%)\n\n"
                 "🔥 Buy activity rising"
             )
 
             print("\n" + message + "\n")
 
-            send_telegram(message)
-
-            alerts += 1
+            if send_telegram(message):
+                alerts += 1
 
         except Exception as e:
 
@@ -388,19 +709,14 @@ def main():
                 f"Error {symbol}: {e}"
             )
 
-        # Avoid API pressure
-        time.sleep(0.12)
+        time.sleep(0.15)
 
-    print("--------------------------------------")
+    print("\n======================================")
     print(
-        f"Scan complete. Alerts: {alerts}"
+        f"Scan complete. Retest alerts: {alerts}"
     )
-    print("--------------------------------------")
+    print("======================================")
 
-
-# =========================================================
-# RUN ONCE AND EXIT
-# =========================================================
 
 if __name__ == "__main__":
     main()
