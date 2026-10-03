@@ -2,7 +2,7 @@ import os
 import time
 import json
 import threading
-from datetime import datetime, timezone
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import requests
@@ -19,57 +19,37 @@ COINGECKO_API = "https://api.coingecko.com/api/v3"
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
-# Low-cap definition
-MAX_MARKET_CAP_USD = float(
-    os.getenv("MAX_MARKET_CAP_USD", "300000000")
-)
+MAX_MARKET_CAP_USD = 300_000_000
+MIN_MARKET_CAP_USD = 1_000_000
 
-MIN_MARKET_CAP_USD = float(
-    os.getenv("MIN_MARKET_CAP_USD", "1000000")
-)
-
-# Early entry
 MAX_ABOVE_24H_LOW = 15.0
 
-# TA
 MIN_RECOVERY_PCT = 15.0
 MAX_RETRACE_PCT = 50.0
+
 MIN_VOLUME_MULTIPLIER = 1.5
 
-# Price should not already be too far from recent range
-MAX_1H_EXTENSION_PCT = 12.0
+SIGNAL_COOLDOWN = 12 * 60 * 60
 
-# Signal cooldown
-SIGNAL_COOLDOWN_SECONDS = 12 * 60 * 60
-
-# Timezone
 BD_TZ = ZoneInfo("Asia/Dhaka")
-
-# Alert windows
-NO_ALERT_START = 1
-NO_ALERT_END = 7
-
-PRIORITY_MORNING_START = 9
-PRIORITY_MORNING_END = 11
-
-PRIORITY_NIGHT_START = 19
-PRIORITY_NIGHT_END = 23
 
 
 # =========================================================
-# GLOBAL DATA
+# GLOBALS
 # =========================================================
 
 symbols = []
 market_caps = {}
 
+latest_price = {}
+latest_24h_low = {}
+
+deposit_status = {}
+
 candles_15m = {}
 candles_1h = {}
 
-latest_price = {}
-latest_24h_low = {}
-deposit_status = {}
-
+loaded_history = set()
 last_signal = {}
 
 lock = threading.Lock()
@@ -80,6 +60,7 @@ lock = threading.Lock()
 # =========================================================
 
 def send_telegram(message):
+
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("Telegram credentials missing")
         return
@@ -89,32 +70,42 @@ def send_telegram(message):
         f"{TELEGRAM_TOKEN}/sendMessage"
     )
 
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": True
-    }
-
     try:
-        r = requests.post(url, json=payload, timeout=10)
+        r = requests.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True
+            },
+            timeout=10
+        )
+
         print("Telegram:", r.status_code)
+
     except Exception as e:
         print("Telegram error:", e)
 
 
 # =========================================================
-# KUCOIN API
+# KUCOIN SYMBOLS
 # =========================================================
 
 def get_symbols():
-    url = f"{KUCOIN_API}/api/v2/symbols"
 
     try:
-        data = requests.get(url, timeout=15).json()
+
+        r = requests.get(
+            f"{KUCOIN_API}/api/v2/symbols",
+            timeout=20
+        )
+
+        data = r.json().get("data", [])
 
         result = []
 
-        for x in data.get("data", []):
+        for x in data:
+
             if x.get("quoteCurrency") != "USDT":
                 continue
 
@@ -126,60 +117,99 @@ def get_symbols():
             if symbol:
                 result.append(symbol)
 
-        print("USDT symbols:", len(result))
+        print("KuCoin USDT pairs:", len(result))
+
         return result
 
     except Exception as e:
+
         print("Symbol error:", e)
         return []
 
 
-def get_all_tickers():
-    url = f"{KUCOIN_API}/api/v1/market/allTickers"
+# =========================================================
+# TICKERS
+# =========================================================
+
+def get_tickers():
 
     try:
-        data = requests.get(url, timeout=15).json()
-        return data.get("data", {}).get("ticker", [])
+
+        r = requests.get(
+            f"{KUCOIN_API}/api/v1/market/allTickers",
+            timeout=20
+        )
+
+        return r.json().get(
+            "data",
+            {}
+        ).get(
+            "ticker",
+            []
+        )
 
     except Exception as e:
+
         print("Ticker error:", e)
         return []
 
 
+def update_tickers():
+
+    tickers = get_tickers()
+
+    with lock:
+
+        for t in tickers:
+
+            symbol = t.get("symbol")
+
+            if not symbol:
+                continue
+
+            try:
+
+                price = float(t["last"])
+                low = float(t["low24h"])
+
+            except:
+                continue
+
+            latest_price[symbol] = price
+            latest_24h_low[symbol] = low
+
+
 # =========================================================
-# COINGECKO MARKET CAP
+# MARKET CAP
 # =========================================================
 
 def load_market_caps():
+
     global market_caps
 
     print("Loading market caps...")
 
-    new_caps = {}
+    caps = {}
 
-    # First 4 pages = up to ~1000 coins
     for page in range(1, 5):
 
         try:
-            url = f"{COINGECKO_API}/coins/markets"
-
-            params = {
-                "vs_currency": "usd",
-                "order": "market_cap_desc",
-                "per_page": 250,
-                "page": page,
-                "sparkline": "false"
-            }
 
             r = requests.get(
-                url,
-                params=params,
+                f"{COINGECKO_API}/coins/markets",
+                params={
+                    "vs_currency": "usd",
+                    "order": "market_cap_desc",
+                    "per_page": 250,
+                    "page": page,
+                    "sparkline": "false"
+                },
                 timeout=30
             )
 
             if r.status_code != 200:
                 print(
-                    "CoinGecko status:",
+                    "CoinGecko:",
                     r.status_code
                 )
                 break
@@ -198,35 +228,25 @@ def load_market_caps():
                 cap = coin.get("market_cap")
 
                 if symbol and cap:
-                    # Store maximum cap seen for duplicate symbols
-                    if symbol not in new_caps:
-                        new_caps[symbol] = cap
-                    else:
-                        new_caps[symbol] = max(
-                            new_caps[symbol],
-                            cap
-                        )
+                    caps[symbol] = max(
+                        caps.get(symbol, 0),
+                        cap
+                    )
 
-            time.sleep(1)
+            time.sleep(0.5)
 
         except Exception as e:
-            print(
-                "CoinGecko error:",
-                e
-            )
+
+            print("Market cap error:", e)
             break
 
-    market_caps = new_caps
+    market_caps = caps
 
     print(
-        "Market-cap symbols loaded:",
+        "Market caps loaded:",
         len(market_caps)
     )
 
-
-# =========================================================
-# LOW-CAP FILTER
-# =========================================================
 
 def is_low_cap(symbol):
 
@@ -237,13 +257,11 @@ def is_low_cap(symbol):
     if cap is None:
         return False
 
-    if cap < MIN_MARKET_CAP_USD:
-        return False
-
-    if cap > MAX_MARKET_CAP_USD:
-        return False
-
-    return True
+    return (
+        MIN_MARKET_CAP_USD
+        <= cap
+        <= MAX_MARKET_CAP_USD
+    )
 
 
 # =========================================================
@@ -251,27 +269,19 @@ def is_low_cap(symbol):
 # =========================================================
 
 def update_deposit_status():
-    """
-    KuCoin currency endpoint is checked periodically.
-    """
 
     global deposit_status
 
-    url = f"{KUCOIN_API}/api/v3/currencies"
-
     try:
-        r = requests.get(url, timeout=20)
 
-        if r.status_code != 200:
-            print(
-                "Currency status:",
-                r.status_code
-            )
-            return
+        r = requests.get(
+            f"{KUCOIN_API}/api/v3/currencies",
+            timeout=30
+        )
 
         data = r.json().get("data", [])
 
-        new_status = {}
+        result = {}
 
         for coin in data:
 
@@ -285,105 +295,193 @@ def update_deposit_status():
             if not chains:
                 continue
 
-            enabled = False
+            any_enabled = False
 
             for chain in chains:
 
                 if chain.get("isDepositEnabled"):
-                    enabled = True
+                    any_enabled = True
                     break
 
-            new_status[currency.upper()] = enabled
+            result[
+                currency.upper()
+            ] = any_enabled
 
-        deposit_status = new_status
+        deposit_status = result
 
         print(
-            "Deposit status updated:",
-            len(deposit_status)
+            "Deposit status loaded:",
+            len(result)
         )
 
     except Exception as e:
+
         print(
             "Deposit status error:",
             e
         )
 
 
-def is_deposit_off(symbol):
+def deposit_off(symbol):
 
     base = symbol.split("-")[0]
 
-    status = deposit_status.get(base)
+    value = deposit_status.get(base)
 
-    if status is None:
-        return False
-
-    return status is False
+    return value is False
 
 
 # =========================================================
-# TICKER UPDATE
+# EARLY PRICE CHECK
 # =========================================================
 
-def ticker_loop():
+def above_24h_low(symbol):
 
-    while True:
+    price = latest_price.get(symbol)
+    low = latest_24h_low.get(symbol)
 
-        try:
-            tickers = get_all_tickers()
+    if not price or not low:
+        return None
 
-            with lock:
+    pct = (
+        (price - low)
+        / low
+        * 100
+    )
 
-                for t in tickers:
+    if pct < -2:
+        return None
 
-                    symbol = t.get("symbol")
+    if pct > MAX_ABOVE_24H_LOW:
+        return None
 
-                    if not symbol:
-                        continue
-
-                    try:
-                        price = float(t["last"])
-                        low = float(t["low24h"])
-                    except:
-                        continue
-
-                    latest_price[symbol] = price
-                    latest_24h_low[symbol] = low
-
-        except Exception as e:
-            print("Ticker loop:", e)
-
-        time.sleep(20)
+    return pct
 
 
 # =========================================================
-# CANDLE HELPERS
+# CANDLE LOADING
 # =========================================================
 
-def candle_to_dict(data):
-
-    # KuCoin websocket candle format:
-    # [timestamp, open, close, high, low, volume, turnover]
+def parse_candle(c):
 
     try:
 
         return {
-            "time": int(data[0]),
-            "open": float(data[1]),
-            "close": float(data[2]),
-            "high": float(data[3]),
-            "low": float(data[4]),
-            "volume": float(data[5]),
-            "turnover": float(data[6])
+            "time": int(c[0]),
+            "open": float(c[1]),
+            "close": float(c[2]),
+            "high": float(c[3]),
+            "low": float(c[4]),
+            "volume": float(c[5])
         }
 
     except:
         return None
 
 
-def store_candle(symbol, timeframe, data):
+def load_history(symbol):
 
-    candle = candle_to_dict(data)
+    if symbol in loaded_history:
+        return True
+
+    print(
+        "Loading history:",
+        symbol
+    )
+
+    try:
+
+        for tf, target in [
+            ("15min", candles_15m),
+            ("1hour", candles_1h)
+        ]:
+
+            r = requests.get(
+                f"{KUCOIN_API}/api/v1/market/candles",
+                params={
+                    "symbol": symbol,
+                    "type": tf
+                },
+                timeout=15
+            )
+
+            if r.status_code != 200:
+                return False
+
+            data = r.json().get(
+                "data",
+                []
+            )
+
+            data = list(
+                reversed(data)
+            )
+
+            parsed = []
+
+            for c in data[-100:]:
+
+                candle = parse_candle(c)
+
+                if candle:
+                    parsed.append(candle)
+
+            target[symbol] = parsed
+
+        loaded_history.add(symbol)
+
+        print(
+            "History ready:",
+            symbol
+        )
+
+        return True
+
+    except Exception as e:
+
+        print(
+            "History error:",
+            symbol,
+            e
+        )
+
+        return False
+
+
+# =========================================================
+# LAZY HISTORY LOADING
+# =========================================================
+
+def check_candidates():
+
+    for symbol in symbols:
+
+        if not is_low_cap(symbol):
+            continue
+
+        pct = above_24h_low(symbol)
+
+        if pct is None:
+            continue
+
+        if symbol not in loaded_history:
+
+            load_history(symbol)
+
+        check_signal(symbol)
+
+
+# =========================================================
+# CANDLE STORAGE
+# =========================================================
+
+def store_candle(
+    symbol,
+    timeframe,
+    data
+):
+
+    candle = parse_candle(data)
 
     if not candle:
         return
@@ -399,57 +497,40 @@ def store_candle(symbol, timeframe, data):
 
     arr = target[symbol]
 
-    if arr and arr[-1]["time"] == candle["time"]:
+    if (
+        arr
+        and arr[-1]["time"]
+        == candle["time"]
+    ):
         arr[-1] = candle
+
     else:
         arr.append(candle)
 
-    # Keep enough history
     if len(arr) > 100:
         target[symbol] = arr[-100:]
 
 
 # =========================================================
-# TECHNICAL ANALYSIS
+# 1H PATTERN
 # =========================================================
-
-def percentage(a, b):
-
-    if b == 0:
-        return 0
-
-    return ((a - b) / b) * 100
-
 
 def get_1h_pattern(symbol):
 
-    candles = candles_1h.get(symbol, [])
+    candles = candles_1h.get(
+        symbol,
+        []
+    )
 
     if len(candles) < 30:
         return None
 
     closed = candles[:-1]
 
-    if len(closed) < 25:
-        return None
-
+    earlier = closed[-30:-12]
     recent = closed[-12:]
 
-    # Recent swing low
-    recent_low = min(
-        c["low"]
-        for c in recent
-    )
-
-    recent_high = max(
-        c["high"]
-        for c in recent
-    )
-
-    # Find earlier base
-    earlier = closed[-30:-12]
-
-    if not earlier:
+    if len(earlier) < 10:
         return None
 
     base_low = min(
@@ -457,73 +538,68 @@ def get_1h_pattern(symbol):
         for c in earlier
     )
 
-    recovery = percentage(
-        recent_high,
-        base_low
+    recent_high = max(
+        c["high"]
+        for c in recent
+    )
+
+    recent_low = min(
+        c["low"]
+        for c in recent
+    )
+
+    recovery = (
+        (recent_high - base_low)
+        / base_low
+        * 100
     )
 
     if recovery < MIN_RECOVERY_PCT:
         return None
 
-    # Retracement from recent high
-    retrace = percentage(
-        recent_high,
-        recent_low
+    # Correct retracement calculation
+    retrace = (
+        (recent_high - recent_low)
+        / recent_high
+        * 100
     )
-
-    retrace = abs(retrace)
 
     if retrace > MAX_RETRACE_PCT:
         return None
 
-    # Higher-low check
     mid = len(recent) // 2
-
-    first_half = recent[:mid]
-    second_half = recent[mid:]
 
     low1 = min(
         c["low"]
-        for c in first_half
+        for c in recent[:mid]
     )
 
     low2 = min(
         c["low"]
-        for c in second_half
+        for c in recent[mid:]
     )
 
-    higher_low = low2 > low1 * 0.995
-
-    if not higher_low:
-        return None
-
-    # Current price
-    price = latest_price.get(symbol)
-
-    if not price:
-        return None
-
-    extension = percentage(
-        price,
-        recent_low
-    )
-
-    if extension > MAX_1H_EXTENSION_PCT:
+    if low2 < low1 * 0.995:
         return None
 
     return {
-        "base_low": base_low,
-        "recent_low": recent_low,
-        "recent_high": recent_high,
         "recovery": recovery,
         "retrace": retrace,
-        "higher_low": higher_low
+        "recent_low": recent_low,
+        "recent_high": recent_high
     }
 
 
-def get_15m_confirmation(symbol):
+# =========================================================
+# 15M PATTERN
+# =========================================================
 
-    candles = candles_15m.get(symbol, [])
+def get_15m_pattern(symbol):
+
+    candles = candles_15m.get(
+        symbol,
+        []
+    )
 
     if len(candles) < 25:
         return None
@@ -531,8 +607,8 @@ def get_15m_confirmation(symbol):
     closed = candles[:-1]
 
     recent = closed[-10:]
+    previous = closed[-20:-10]
 
-    # Range
     high = max(
         c["high"]
         for c in recent
@@ -547,39 +623,28 @@ def get_15m_confirmation(symbol):
         return None
 
     range_pct = (
-        (high - low) / low
-    ) * 100
+        (high - low)
+        / low
+        * 100
+    )
 
-    # We want consolidation, not huge expansion
     if range_pct > 12:
         return None
 
-    # Support hold
     support = min(
         c["low"]
         for c in recent[:-3]
     )
 
-    last_candles = recent[-3:]
+    for c in recent[-3:]:
 
-    support_holds = all(
-        c["close"] >= support * 0.985
-        for c in last_candles
-    )
-
-    if not support_holds:
-        return None
-
-    # Volume expansion
-    old = closed[-20:-10]
-
-    if not old:
-        return None
+        if c["close"] < support * 0.985:
+            return None
 
     avg_volume = sum(
         c["volume"]
-        for c in old
-    ) / len(old)
+        for c in previous
+    ) / len(previous)
 
     recent_volume = sum(
         c["volume"]
@@ -590,27 +655,25 @@ def get_15m_confirmation(symbol):
         return None
 
     volume_multiplier = (
-        recent_volume / avg_volume
+        recent_volume
+        / avg_volume
     )
 
     if volume_multiplier < MIN_VOLUME_MULTIPLIER:
         return None
-
-    # Resistance
-    resistance = high
 
     price = latest_price.get(symbol)
 
     if not price:
         return None
 
-    resistance_distance = percentage(
-        resistance,
-        price
+    # Near resistance
+    resistance_distance = (
+        (high - price)
+        / price
+        * 100
     )
 
-    # Price should be near resistance,
-    # not far below it
     if resistance_distance < 0:
         resistance_distance = 0
 
@@ -619,93 +682,53 @@ def get_15m_confirmation(symbol):
 
     return {
         "support": support,
-        "resistance": resistance,
-        "range_pct": range_pct,
-        "volume_multiplier": volume_multiplier,
-        "resistance_distance": resistance_distance
+        "resistance": high,
+        "range": range_pct,
+        "volume": volume_multiplier
     }
-
-
-# =========================================================
-# EARLY ENTRY FILTER
-# =========================================================
-
-def early_price_filter(symbol):
-
-    price = latest_price.get(symbol)
-    low = latest_24h_low.get(symbol)
-
-    if not price or not low:
-        return None
-
-    above_low = percentage(
-        price,
-        low
-    )
-
-    # HARD FILTER
-    if above_low > MAX_ABOVE_24H_LOW:
-        return None
-
-    # Avoid weird ticker data
-    if above_low < -2:
-        return None
-
-    return above_low
 
 
 # =========================================================
 # TIME FILTER
 # =========================================================
 
-def get_time_state():
+def time_state():
 
-    now = datetime.now(BD_TZ)
+    hour = datetime.now(
+        BD_TZ
+    ).hour
 
-    hour = now.hour
-
-    # No signal 01:00–07:00
-    if (
-        hour >= NO_ALERT_START
-        and hour < NO_ALERT_END
-    ):
+    # No alerts
+    if 1 <= hour < 7:
         return "OFF"
 
-    # Priority windows
-    if (
-        PRIORITY_MORNING_START
-        <= hour
-        < PRIORITY_MORNING_END
-    ):
+    # Priority
+    if 9 <= hour < 11:
         return "PRIORITY"
 
-    if (
-        PRIORITY_NIGHT_START
-        <= hour
-        < PRIORITY_NIGHT_END
-    ):
+    if 19 <= hour < 23:
         return "PRIORITY"
 
     return "NORMAL"
 
 
 # =========================================================
-# SIGNAL ENGINE
+# SIGNAL
 # =========================================================
 
 def check_signal(symbol):
 
-    if not is_low_cap(symbol):
+    if symbol not in loaded_history:
         return
 
-    time_state = get_time_state()
+    state = time_state()
 
-    if time_state == "OFF":
+    if state == "OFF":
         return
 
-    above_low = early_price_filter(symbol)
+    pct = above_24h_low(symbol)
 
-    if above_low is None:
+    if pct is None:
         return
 
     h1 = get_1h_pattern(symbol)
@@ -713,43 +736,52 @@ def check_signal(symbol):
     if not h1:
         return
 
-    m15 = get_15m_confirmation(symbol)
+    m15 = get_15m_pattern(symbol)
 
     if not m15:
         return
 
-    price = latest_price.get(symbol)
-
-    if not price:
-        return
-
-    deposit_off = is_deposit_off(symbol)
-
-    # Stronger when deposit is OFF
-    score = 0
-
-    score += 30
-    score += 25
-    score += 20
-
-    if deposit_off:
-        score += 15
-
-    if time_state == "PRIORITY":
-        score += 10
-
-    if above_low <= 10:
-        score += 5
-
-    # Only alert strong setups
-    if score < 80:
-        return
-
     now = time.time()
 
-    previous = last_signal.get(symbol, 0)
+    previous = last_signal.get(
+        symbol,
+        0
+    )
 
-    if now - previous < SIGNAL_COOLDOWN_SECONDS:
+    if (
+        now - previous
+        < SIGNAL_COOLDOWN
+    ):
+        return
+
+    price = latest_price.get(
+        symbol
+    )
+
+    low = latest_24h_low.get(
+        symbol
+    )
+
+    if not price or not low:
+        return
+
+    dep_off = deposit_off(
+        symbol
+    )
+
+    # Score
+    score = 80
+
+    if dep_off:
+        score += 15
+
+    if state == "PRIORITY":
+        score += 5
+
+    if pct <= 10:
+        score += 5
+
+    if score < 80:
         return
 
     last_signal[symbol] = now
@@ -765,27 +797,28 @@ def check_signal(symbol):
 {symbol}
 
 💰 Price: {price:.10g}
-📉 24H Low: {latest_24h_low.get(symbol, 0):.10g}
-📊 Above 24H Low: +{above_low:.1f}%
+📉 24H Low: {low:.10g}
+📊 Above Low: +{pct:.1f}%
 
-📈 1H Structure
+📈 1H
 Recovery: +{h1['recovery']:.1f}%
 Retrace: {h1['retrace']:.1f}%
 Higher Low: ✅
 
-⏱ 15M Structure
-Consolidation: {m15['range_pct']:.1f}%
+⏱ 15M
 Support: {m15['support']:.10g}
 Resistance: {m15['resistance']:.10g}
-Volume: {m15['volume_multiplier']:.1f}x
+Volume: {m15['volume']:.1f}x
 
-🔴 Deposit OFF: {"YES" if deposit_off else "NO"}
+🔴 Deposit OFF:
+{"YES" if dep_off else "NO"}
 
-💎 Market Cap: ${cap:,.0f}
-⏰ Window: {time_state}
+💎 Market Cap:
+${cap:,.0f}
 
-🔥 Pattern Match: STRONG
-🎯 Early Entry: YES
+⏰ {state} WINDOW
+
+🔥 EARLY PATTERN MATCH
 """
 
     print(message)
@@ -796,292 +829,33 @@ Volume: {m15['volume_multiplier']:.1f}x
 
 
 # =========================================================
-# WEBSOCKET
+# FAST TICKER LOOP
 # =========================================================
 
-def get_ws_token():
-
-    url = (
-        f"{KUCOIN_API}"
-        "/api/v1/bullet-public"
-    )
-
-    r = requests.post(
-        url,
-        timeout=15
-    )
-
-    data = r.json()["data"]
-
-    token = data["token"]
-
-    server = data["instanceServers"][0]
-
-    endpoint = server["endpoint"]
-
-    ping_interval = (
-        server.get("pingInterval", 18000)
-        / 1000
-    )
-
-    return token, endpoint, ping_interval
-
-
-def websocket_worker():
+def ticker_loop():
 
     while True:
 
         try:
 
-            token, endpoint, ping_interval = (
-                get_ws_token()
-            )
+            update_tickers()
 
-            connect_url = (
-                f"{endpoint}"
-                f"?token={token}"
-            )
-
-            ws = websocket.create_connection(
-                connect_url,
-                timeout=30
-            )
-
-            print("WebSocket connected")
-
-            sub_id = 1
-
-            # Subscribe in chunks
-            for i in range(
-                0,
-                len(symbols),
-                50
-            ):
-
-                chunk = symbols[i:i + 50]
-
-                # 15m candles
-                for symbol in chunk:
-
-                    ws.send(
-                        json.dumps({
-                            "id": str(sub_id),
-                            "type": "subscribe",
-                            "topic": (
-                                f"/market/candles:"
-                                f"{symbol}_15min"
-                            ),
-                            "privateChannel": False,
-                            "response": True
-                        })
-                    )
-
-                    sub_id += 1
-
-                    # 1h candles
-                    ws.send(
-                        json.dumps({
-                            "id": str(sub_id),
-                            "type": "subscribe",
-                            "topic": (
-                                f"/market/candles:"
-                                f"{symbol}_1hour"
-                            ),
-                            "privateChannel": False,
-                            "response": True
-                        })
-                    )
-
-                    sub_id += 1
-
-                time.sleep(0.5)
-
-            last_ping = time.time()
-
-            while True:
-
-                if (
-                    time.time() - last_ping
-                    > ping_interval / 2
-                ):
-                    ws.send(
-                        json.dumps({
-                            "id": str(
-                                int(time.time())
-                            ),
-                            "type": "ping"
-                        })
-                    )
-
-                    last_ping = time.time()
-
-                ws.settimeout(5)
-
-                try:
-                    raw = ws.recv()
-
-                except websocket.WebSocketTimeoutException:
-                    continue
-
-                if not raw:
-                    continue
-
-                try:
-                    msg = json.loads(raw)
-                except:
-                    continue
-
-                if msg.get("type") != "message":
-                    continue
-
-                topic = msg.get("topic", "")
-
-                data = msg.get("data")
-
-                if not data:
-                    continue
-
-                # Topic:
-                # /market/candles:BTC-USDT_15min
-
-                if "/market/candles:" not in topic:
-                    continue
-
-                try:
-
-                    pair = topic.split(
-                        "/market/candles:"
-                    )[1]
-
-                    if pair.endswith("_15min"):
-
-                        symbol = pair.replace(
-                            "_15min",
-                            ""
-                        )
-
-                        with lock:
-                            store_candle(
-                                symbol,
-                                "15min",
-                                data["candles"]
-                            )
-
-                        check_signal(symbol)
-
-                    elif pair.endswith("_1hour"):
-
-                        symbol = pair.replace(
-                            "_1hour",
-                            ""
-                        )
-
-                        with lock:
-                            store_candle(
-                                symbol,
-                                "1hour",
-                                data["candles"]
-                            )
-
-                        check_signal(symbol)
-
-                except Exception as e:
-                    print(
-                        "WS message error:",
-                        e
-                    )
+            # Only load history for
+            # coins currently near 24H low
+            check_candidates()
 
         except Exception as e:
 
             print(
-                "WebSocket disconnected:",
+                "Ticker loop error:",
                 e
             )
 
-            time.sleep(5)
+        time.sleep(20)
 
 
 # =========================================================
-# INITIAL CANDLE LOAD
-# =========================================================
-
-def load_initial_candles():
-
-    print("Loading initial candles...")
-
-    for index, symbol in enumerate(symbols):
-
-        try:
-
-            for timeframe, tf in [
-                ("15min", "15min"),
-                ("1hour", "1hour")
-            ]:
-
-                url = (
-                    f"{KUCOIN_API}"
-                    "/api/v1/market/candles"
-                )
-
-                params = {
-                    "symbol": symbol,
-                    "type": tf
-                }
-
-                r = requests.get(
-                    url,
-                    params=params,
-                    timeout=10
-                )
-
-                if r.status_code != 200:
-                    continue
-
-                data = r.json().get(
-                    "data",
-                    []
-                )
-
-                # KuCoin returns newest first
-                data = list(reversed(data))
-
-                target = (
-                    candles_15m
-                    if timeframe == "15min"
-                    else candles_1h
-                )
-
-                target[symbol] = []
-
-                for candle in data[-100:]:
-
-                    c = candle_to_dict(candle)
-
-                    if c:
-                        target[symbol].append(c)
-
-            if index % 20 == 0:
-                print(
-                    "Initial candles:",
-                    index,
-                    "/",
-                    len(symbols)
-                )
-
-            # Avoid hammering API
-            time.sleep(0.12)
-
-        except Exception as e:
-
-            print(
-                "Initial candle error:",
-                symbol,
-                e
-            )
-
-
-# =========================================================
-# DEPOSIT REFRESH LOOP
+# DEPOSIT LOOP
 # =========================================================
 
 def deposit_loop():
@@ -1090,22 +864,159 @@ def deposit_loop():
 
         update_deposit_status()
 
-        # Every 5 minutes
         time.sleep(300)
 
 
 # =========================================================
-# MARKET CAP REFRESH LOOP
+# WEBSOCKET
 # =========================================================
 
-def market_cap_loop():
+def websocket_worker():
 
     while True:
 
-        load_market_caps()
+        try:
 
-        # Refresh every 2 hours
-        time.sleep(7200)
+            r = requests.post(
+                f"{KUCOIN_API}/api/v1/bullet-public",
+                timeout=20
+            )
+
+            data = r.json()["data"]
+
+            token = data["token"]
+
+            server = (
+                data["instanceServers"][0]
+            )
+
+            endpoint = server["endpoint"]
+
+            ws = websocket.create_connection(
+                f"{endpoint}?token={token}",
+                timeout=30
+            )
+
+            print(
+                "✅ WebSocket connected"
+            )
+
+            sub_id = 1
+
+            for symbol in symbols:
+
+                for tf in [
+                    "15min",
+                    "1hour"
+                ]:
+
+                    ws.send(
+                        json.dumps({
+                            "id": str(sub_id),
+                            "type": "subscribe",
+                            "topic":
+                                f"/market/candles:"
+                                f"{symbol}_{tf}",
+                            "privateChannel":
+                                False,
+                            "response":
+                                True
+                        })
+                    )
+
+                    sub_id += 1
+
+                time.sleep(0.02)
+
+            print(
+                "✅ WebSocket subscriptions ready"
+            )
+
+            while True:
+
+                try:
+
+                    raw = ws.recv()
+
+                    if not raw:
+                        continue
+
+                    msg = json.loads(raw)
+
+                    if msg.get(
+                        "type"
+                    ) != "message":
+                        continue
+
+                    topic = msg.get(
+                        "topic",
+                        ""
+                    )
+
+                    data = msg.get(
+                        "data"
+                    )
+
+                    if not data:
+                        continue
+
+                    if "/market/candles:" not in topic:
+                        continue
+
+                    pair = topic.split(
+                        "/market/candles:"
+                    )[1]
+
+                    if pair.endswith(
+                        "_15min"
+                    ):
+
+                        symbol = pair.replace(
+                            "_15min",
+                            ""
+                        )
+
+                        store_candle(
+                            symbol,
+                            "15min",
+                            data["candles"]
+                        )
+
+                        check_signal(
+                            symbol
+                        )
+
+                    elif pair.endswith(
+                        "_1hour"
+                    ):
+
+                        symbol = pair.replace(
+                            "_1hour",
+                            ""
+                        )
+
+                        store_candle(
+                            symbol,
+                            "1hour",
+                            data["candles"]
+                        )
+
+                        check_signal(
+                            symbol
+                        )
+
+                except websocket.WebSocketTimeoutException:
+
+                    continue
+
+        except Exception as e:
+
+            print(
+                "WebSocket error:",
+                e
+            )
+
+            time.sleep(5)
 
 
 # =========================================================
@@ -1119,70 +1030,65 @@ def main():
     if not TELEGRAM_TOKEN or not CHAT_ID:
 
         print(
-            "ERROR: TELEGRAM_TOKEN / CHAT_ID "
-            "environment variables missing."
+            "ERROR: TELEGRAM_TOKEN / CHAT_ID missing"
         )
 
         return
 
     print(
-        "======================================"
+        "================================="
     )
 
     print(
-        "KuCoin Influencer-Style Early Buyer"
+        "KUCOIN EARLY BUY DETECTOR"
     )
 
     print(
-        "======================================"
+        "================================="
     )
 
+    # 1. Symbols
     symbols = get_symbols()
 
     if not symbols:
-        print("No symbols found.")
         return
 
-    # Load market cap first
+    # 2. Market cap
     load_market_caps()
 
-    # Keep only low-cap established coins
+    # 3. Low-cap only
     symbols = [
         s for s in symbols
         if is_low_cap(s)
     ]
 
     print(
-        "Low-cap symbols:",
+        "Low-cap pairs:",
         len(symbols)
     )
 
-    if not symbols:
-        print(
-            "No low-cap symbols matched."
-        )
-        return
+    # 4. Initial ticker
+    update_tickers()
 
+    # 5. Deposit status
     update_deposit_status()
 
-    # Initial historical candles
-    load_initial_candles()
+    print(
+        "⚡ Starting real-time monitoring..."
+    )
 
-    # Background ticker
+    # IMPORTANT:
+    # Do NOT load history for every coin.
+    # ticker_loop will load it only when
+    # price enters <=15% above 24H low.
+
     threading.Thread(
         target=ticker_loop,
         daemon=True
     ).start()
 
-    # Deposit status
     threading.Thread(
         target=deposit_loop,
-        daemon=True
-    ).start()
-
-    # Market cap refresh
-    threading.Thread(
-        target=market_cap_loop,
         daemon=True
     ).start()
 
