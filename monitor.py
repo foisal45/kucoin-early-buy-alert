@@ -1,1010 +1,308 @@
 import os
-import time
 import json
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
 import requests
-import websocket
-from collections import defaultdict, deque
 
 API = "https://api.kucoin.com"
+TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()
+STATE_FILE = Path("state.json")
+TIMEOUT = 15
 
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+# Add/adjust mappings as needed. Automatic narrative detection is heuristic,
+# because KuCoin's public ticker API does not provide a reliable narrative field.
+NARRATIVE_KEYWORDS = {
+    "AI": ["artificial intelligence", " ai ", "ai agent", "ai"],
+    "MEME": ["meme", "doge", "shib", "inu", "pepe", "bonk", "floki", "wif"],
+    "GAMING": ["gaming", "game", "metaverse", "play to earn", "p2e"],
+    "DEFI": ["defi", "decentralized finance", "lending", "yield", "dex"],
+    "RWA": ["real world asset", " rwa ", "tokenized asset"],
+    "LAYER 1": ["layer 1", "layer-1", "blockchain", "smart contract"],
+    "LAYER 2": ["layer 2", "layer-2", "rollup", "scaling"],
+    "DEPIN": ["depin", "decentralized physical infrastructure"],
+    "AI / DEPIN": ["depin", "artificial intelligence"],
+}
 
-# ==============================
-# SETTINGS
-# ==============================
+# Optional manual ST list: set GitHub secret/variable ST_COINS="ABC,XYZ"
+MANUAL_ST = {
+    x.strip().upper()
+    for x in os.getenv("ST_COINS", "").split(",")
+    if x.strip()
+}
 
-# Minimum first move from today's starting/accumulation area
-MIN_PUMP = 15.0
-
-# Retest must come close to original buying zone
-ZONE_DISTANCE = 6.0
-
-# Buying must be meaningfully larger than selling
-BUY_SELL_RATIO = 1.30
-
-# Minimum meaningful market buy
-MIN_BUY_USD = 250
-
-# Need repeated buying
-MIN_BUYS = 3
-
-# Same coin alert cooldown
-COOLDOWN = 6 * 60 * 60
-
-# Ignore new listings
-MIN_LISTED_DAYS = 30
-
-
-# ==============================
-# DATA
-# ==============================
-
-trades = defaultdict(
-    lambda: deque(maxlen=1000)
-)
-
-last_alert = {}
-
-today_structure = {}
+session = requests.Session()
+session.headers.update({"User-Agent": "KuCoin-Narrative-Watchlist/1.0"})
 
 
-# ==============================
-# TELEGRAM
-# ==============================
+def get_json(path, params=None):
+    response = session.get(API + path, params=params, timeout=TIMEOUT)
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("code") != "200000":
+        raise RuntimeError(f"KuCoin API error at {path}: {payload.get('msg')}")
+    return payload.get("data")
 
-def send_telegram(message):
 
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"above_100": [], "watchlist": [], "setup_alerts": {}, "daily_summary_date": ""}
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+
+
+def telegram(message):
     if not TOKEN or not CHAT_ID:
-        print("Telegram secrets missing")
-        return False
-
-    url = (
-        "https://api.telegram.org/bot"
-        + TOKEN
-        + "/sendMessage"
+        raise RuntimeError("Missing TELEGRAM_TOKEN or CHAT_ID GitHub secret.")
+    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+    response = session.post(
+        url,
+        json={"chat_id": CHAT_ID, "text": message, "disable_web_page_preview": True},
+        timeout=TIMEOUT,
     )
-
-    try:
-        r = requests.post(
-            url,
-            json={
-                "chat_id": CHAT_ID,
-                "text": message
-            },
-            timeout=15
-        )
-
-        print("Telegram:", r.status_code)
-
-        return r.status_code == 200
-
-    except Exception as e:
-        print("Telegram error:", e)
-        return False
+    response.raise_for_status()
+    result = response.json()
+    if not result.get("ok"):
+        raise RuntimeError(f"Telegram API error: {result}")
 
 
-# ==============================
-# KUCOIN SYMBOLS
-# ==============================
-
-def get_symbols():
-
-    try:
-
-        r = requests.get(
-            API + "/api/v2/symbols",
-            timeout=20
-        )
-
-        data = r.json().get(
-            "data",
-            []
-        )
-
-    except Exception as e:
-
-        print("Symbol error:", e)
-        return []
-
-    now = int(
-        time.time() * 1000
-    )
-
-    result = []
-
-    for x in data:
-
+def get_st_coins():
+    """Best-effort auto-detection from recent KuCoin announcements + manual list."""
+    st = set(MANUAL_ST)
+    terms = ("st tag", "special treatment", "st-tag", "will add st")
+    for page in range(1, 4):
         try:
-
-            if x.get("quoteCurrency") != "USDT":
-                continue
-
-            if not x.get("enableTrading"):
-                continue
-
-            listed = x.get("listAt")
-
-            if listed:
-
-                age_days = (
-                    now - int(listed)
-                ) / 86400000
-
-                if age_days < MIN_LISTED_DAYS:
-                    continue
-
-            result.append(
-                x["symbol"]
+            data = get_json(
+                "/api/v3/announcements",
+                {"currentPage": page, "pageSize": 100, "annType": "latest-announcements", "lang": "en_US"},
             )
+            for item in (data or {}).get("items", []):
+                title = str(item.get("annTitle", ""))
+                desc = str(item.get("annDesc", ""))
+                combined = (title + " " + desc).lower()
+                if any(term in combined for term in terms):
+                    # Extract likely tickers shown in parentheses, e.g. Token (ABC).
+                    for match in re.findall(r"\(([A-Z0-9]{2,15})\)", title + " " + desc):
+                        st.add(match.upper())
+        except Exception as exc:
+            print(f"ST announcement scan warning: {exc}")
+            break
+    return st
 
-        except Exception:
+
+def classify_narrative(name, symbol):
+    text = f" {name or ''} {symbol or ''} ".lower()
+    # More specific category first.
+    for category in ("AI / DEPIN", "AI", "MEME", "GAMING", "DEFI", "RWA", "LAYER 2", "LAYER 1", "DEPIN"):
+        if any(word in text for word in NARRATIVE_KEYWORDS[category]):
+            return category
+    return "UNKNOWN"
+
+
+def fetch_market_data():
+    tickers = get_json("/api/v1/market/allTickers")["ticker"]
+    symbols = get_json("/api/v2/symbols")
+    currencies = get_json("/api/v3/currencies")
+
+    symbol_info = {
+        s.get("symbol"): s for s in symbols
+        if s.get("quoteCurrency") == "USDT" and s.get("enableTrading", True)
+    }
+    currency_info = {c.get("currency"): c for c in currencies if c.get("currency")}
+    usdt = []
+    for ticker in tickers:
+        pair = ticker.get("symbol", "")
+        if not pair.endswith("-USDT") or pair not in symbol_info:
             continue
+        try:
+            change = float(ticker.get("changeRate") or 0) * 100
+            volume_usd = float(ticker.get("volValue") or 0)
+            price = float(ticker.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+        base = pair[:-5]
+        info = symbol_info[pair]
+        currency = currency_info.get(base, {})
+        full_name = currency.get("fullName") or currency.get("name") or base
+        usdt.append({
+            "pair": pair, "base": base, "change": change, "volume_usd": volume_usd,
+            "price": price, "name": full_name, "symbol_info": info,
+        })
+    usdt.sort(key=lambda x: x["change"], reverse=True)
+    return usdt, currency_info
 
-    print(
-        "USDT coins:",
-        len(result)
-    )
 
+def fully_deposit_off(currency_info):
+    """True only when every listed network is explicitly deposit-disabled."""
+    result = set()
+    for code, info in currency_info.items():
+        chains = info.get("chains") or []
+        if chains and all(chain.get("isDepositEnabled") is False for chain in chains):
+            result.add(code.upper())
     return result
 
 
-# ==============================
-# 15M CANDLES
-# ==============================
-
-def get_candles(symbol):
-
-    end = int(time.time())
-
-    # Today's data only
-    start = end - 86400
-
-    params = {
-        "symbol": symbol,
-        "type": "15min",
-        "startAt": start,
-        "endAt": end
-    }
-
-    try:
-
-        r = requests.get(
-            API + "/api/v1/market/candles",
-            params=params,
-            timeout=15
-        )
-
-        if r.status_code != 200:
-            return []
-
-        raw = r.json().get(
-            "data",
-            []
-        )
-
-    except Exception:
-        return []
-
+def get_candles(pair, candle_type, limit=100):
+    data = get_json(
+        "/api/v1/market/candles",
+        {"symbol": pair, "type": candle_type},
+    )
+    # KuCoin returns newest-first: [time, open, close, high, low, volume, turnover].
     candles = []
-
-    for c in raw:
-
+    for row in (data or [])[:limit]:
         try:
-
             candles.append({
-                "time": int(c[0]),
-                "open": float(c[1]),
-                "close": float(c[2]),
-                "high": float(c[3]),
-                "low": float(c[4]),
-                "volume": float(c[5])
+                "time": int(row[0]), "open": float(row[1]), "close": float(row[2]),
+                "high": float(row[3]), "low": float(row[4]), "volume": float(row[5]),
             })
-
-        except Exception:
+        except (TypeError, ValueError, IndexError):
             continue
+    return sorted(candles, key=lambda x: x["time"])
+
+
+def setup_check(coin):
+    """Conservative heuristic: 1H structure + green 15m candle/volume + near 24h low."""
+    pair = coin["pair"]
+    hourly = get_candles(pair, "1hour", 12)
+    fifteen = get_candles(pair, "15min", 100)
+    if len(hourly) < 7 or len(fifteen) < 9:
+        return False, "Not enough candles"
+
+    h_closes = [c["close"] for c in hourly]
+    h_avg = sum(h_closes[-6:]) / 6
+    h_ok = h_closes[-1] > h_avg and h_closes[-1] >= h_closes[-2]
+
+    latest = fifteen[-1]
+    prior_vols = [c["volume"] for c in fifteen[-9:-1]]
+    avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
+    m15_ok = latest["close"] > latest["open"] and avg_vol > 0 and latest["volume"] >= avg_vol * 1.2
+
+    # Current price should remain within +15% of 24h low, matching the requested retest zone.
+    low_24h = min(c["low"] for c in fifteen[-96:]) if len(fifteen) >= 96 else min(c["low"] for c in fifteen)
+    near_low = coin["price"] > 0 and coin["price"] <= low_24h * 1.15
+    if h_ok and m15_ok and near_low:
+        return True, "1H trend + 15M green/volume + near-low retest"
+    return False, "Waiting for confirmation"
 
-    candles.sort(
-        key=lambda x: x["time"]
-    )
-
-    return candles
-
-
-# ==============================
-# BUILD TODAY'S FIRST BUY ZONE
-# ==============================
-
-def build_structure(symbol):
-
-    cs = get_candles(symbol)
-
-    if len(cs) < 12:
-        return None
-
-    # Ignore current unfinished candle
-    completed = cs[:-1]
-
-    if len(completed) < 10:
-        return None
-
-    # Only today's candles
-    day = completed[-96:]
-
-    if len(day) < 10:
-        return None
-
-    # Find the strongest volume candle
-    # before the first major move
-    volume_sorted = sorted(
-        day,
-        key=lambda x: x["volume"],
-        reverse=True
-    )
-
-    candidates = volume_sorted[:8]
-
-    best = None
-
-    for c in candidates:
-
-        price = c["close"]
-
-        if price <= 0:
-            continue
-
-        # Volume average before this candle
-        index = day.index(c)
-
-        if index < 3:
-            continue
-
-        previous = day[
-            max(0, index - 5):index
-        ]
-
-        avg_volume = sum(
-            x["volume"]
-            for x in previous
-        ) / len(previous)
-
-        if avg_volume <= 0:
-            continue
-
-        volume_ratio = (
-            c["volume"]
-            / avg_volume
-        )
-
-        # We want unusual activity
-        if volume_ratio < 1.5:
-            continue
-
-        if best is None:
-            best = (
-                c,
-                volume_ratio
-            )
-
-    if not best:
-        return None
-
-    zone_candle = best[0]
-    volume_ratio = best[1]
-
-    zone_low = zone_candle["low"]
-    zone_high = zone_candle["high"]
-
-    # Search price movement after zone
-    zone_index = day.index(
-        zone_candle
-    )
-
-    after = day[
-        zone_index + 1:
-    ]
-
-    if len(after) < 3:
-        return None
-
-    peak = max(
-        x["high"]
-        for x in after
-    )
-
-    # Pump from zone
-    pump = (
-        (peak - zone_high)
-        / zone_high
-    ) * 100
-
-    if pump < MIN_PUMP:
-        return None
-
-    return {
-        "zone_low": zone_low,
-        "zone_high": zone_high,
-        "peak": peak,
-        "pump": pump,
-        "volume_ratio": volume_ratio,
-        "zone_time": zone_candle["time"]
-    }
-
-
-# ==============================
-# CHECK RETEST
-# ==============================
-
-def check_retest(symbol):
-
-    structure = today_structure.get(
-        symbol
-    )
-
-    if not structure:
-        return None
-
-    cs = get_candles(symbol)
-
-    if len(cs) < 5:
-        return None
-
-    current = cs[-2]
-
-    price = current["close"]
-
-    zone_low = structure[
-        "zone_low"
-    ]
-
-    zone_high = structure[
-        "zone_high"
-    ]
-
-    # Expanded retest zone
-    lower = zone_low * (
-        1 - ZONE_DISTANCE / 100
-    )
-
-    upper = zone_high * (
-        1 + ZONE_DISTANCE / 100
-    )
-
-    # Price must return close to original
-    # buying zone
-    if price < lower:
-        return None
-
-    if price > upper:
-        return None
-
-    # Current candle should show buying
-    if current["close"] <= current["open"]:
-        return None
-
-    # Compare current volume
-    previous = cs[-7:-2]
-
-    if len(previous) < 3:
-        return None
-
-    avg_volume = sum(
-        x["volume"]
-        for x in previous
-    ) / len(previous)
-
-    if avg_volume <= 0:
-        return None
-
-    volume_ratio = (
-        current["volume"]
-        / avg_volume
-    )
-
-    # Fresh volume must return
-    if volume_ratio < 1.20:
-        return None
-
-    return {
-        "price": price,
-        "volume_ratio": volume_ratio
-    }
-
-
-# ==============================
-# BUYING FOOTPRINT
-# ==============================
-
-def buying_again(symbol):
-
-    now = time.time()
-
-    recent = [
-        x
-        for x in trades[symbol]
-        if now - x["time"] <= 180
-    ]
-
-    buys = [
-        x
-        for x in recent
-        if x["side"] == "buy"
-    ]
-
-    sells = [
-        x
-        for x in recent
-        if x["side"] == "sell"
-    ]
-
-    big_buys = [
-        x
-        for x in buys
-        if x["usd"] >= MIN_BUY_USD
-    ]
-
-    if len(big_buys) < MIN_BUYS:
-        return None
-
-    buy_usd = sum(
-        x["usd"]
-        for x in buys
-    )
-
-    sell_usd = sum(
-        x["usd"]
-        for x in sells
-    )
-
-    if sell_usd > 0:
-        ratio = (
-            buy_usd / sell_usd
-        )
-    else:
-        ratio = 999
-
-    if ratio < BUY_SELL_RATIO:
-        return None
-
-    return {
-        "buys": len(big_buys),
-        "ratio": ratio
-    }
-
-
-# ==============================
-# 1H CONFIRMATION
-# ==============================
-
-def check_1h(symbol):
-
-    end = int(time.time())
-
-    start = end - (
-        48 * 60 * 60
-    )
-
-    params = {
-        "symbol": symbol,
-        "type": "1hour",
-        "startAt": start,
-        "endAt": end
-    }
-
-    try:
-
-        r = requests.get(
-            API + "/api/v1/market/candles",
-            params=params,
-            timeout=15
-        )
-
-        raw = r.json().get(
-            "data",
-            []
-        )
-
-    except Exception:
-        return False
-
-    if len(raw) < 8:
-        return False
-
-    cs = []
-
-    for c in raw:
-
-        try:
-
-            cs.append({
-                "open": float(c[1]),
-                "close": float(c[2]),
-                "high": float(c[3]),
-                "low": float(c[4])
-            })
-
-        except Exception:
-            continue
-
-    if len(cs) < 6:
-        return False
-
-    cs = cs[:-1]
-
-    recent = cs[-4:]
-
-    # Recent 1H structure should not be
-    # making continuous lower lows
-    lows = [
-        x["low"]
-        for x in recent
-    ]
-
-    if lows[-1] < min(
-        lows[:-1]
-    ) * 0.97:
-        return False
-
-    # Last completed 1H candle
-    last = recent[-1]
-
-    # Avoid strongly bearish candle
-    if last["close"] < last["open"]:
-
-        body = (
-            last["open"]
-            - last["close"]
-        )
-
-        range_size = (
-            last["high"]
-            - last["low"]
-        )
-
-        if range_size > 0:
-
-            if body / range_size > 0.65:
-                return False
-
-    return True
-
-
-# ==============================
-# FINAL SIGNAL
-# ==============================
-
-def check_signal(symbol):
-
-    structure = today_structure.get(
-        symbol
-    )
-
-    if not structure:
-        return
-
-    retest = check_retest(
-        symbol
-    )
-
-    if not retest:
-        return
-
-    # 1H must be healthy
-    if not check_1h(symbol):
-        return
-
-    # Fresh buying must return
-    buying = buying_again(
-        symbol
-    )
-
-    if not buying:
-        return
-
-    now = time.time()
-
-    if symbol in last_alert:
-
-        if (
-            now - last_alert[symbol]
-            < COOLDOWN
-        ):
-            return
-
-    message = (
-        "🚨 SECOND MOVE SETUP\n\n"
-        "🪙 " + symbol + "\n"
-        "📍 Buy Zone: "
-        + format(
-            structure["zone_low"],
-            ".8g"
-        )
-        + " - "
-        + format(
-            structure["zone_high"],
-            ".8g"
-        )
-        + "\n"
-        "🚀 First Move: +"
-        + format(
-            structure["pump"],
-            ".1f"
-        )
-        + "%\n"
-        "🔄 Same Zone Retest\n"
-        "🔥 Fresh Buying: "
-        + str(
-            buying["buys"]
-        )
-        + " buys\n"
-        "💵 Buy/Sell: "
-        + format(
-            buying["ratio"],
-            ".1f"
-        )
-        + "x\n"
-        "📊 1H: Bullish/Healthy"
-    )
-
-    print(
-        "\n" + message + "\n"
-    )
-
-    if send_telegram(
-        message
-    ):
-
-        last_alert[symbol] = now
-
-
-# ==============================
-# WEBSOCKET
-# ==============================
-
-def get_ws():
-
-    try:
-
-        r = requests.post(
-            API + "/api/v1/bullet-public",
-            timeout=20
-        )
-
-        data = r.json()["data"]
-
-        endpoint = data[
-            "instanceServers"
-        ][0]["endpoint"]
-
-        token = data["token"]
-
-        return endpoint, token
-
-    except Exception as e:
-
-        print(
-            "WS token error:",
-            e
-        )
-
-        return None
-
-
-def run_websocket(symbol_list):
-
-    while True:
-
-        info = get_ws()
-
-        if not info:
-
-            time.sleep(10)
-            continue
-
-        endpoint, token = info
-
-        url = (
-            endpoint
-            + "?token="
-            + token
-            + "&connectId="
-            + str(
-                int(
-                    time.time() * 1000
-                )
-            )
-        )
-
-        print(
-            "Connecting WebSocket..."
-        )
-
-        def on_open(ws):
-
-            print(
-                "WebSocket connected."
-            )
-
-            chunk_size = 50
-
-            for i in range(
-                0,
-                len(symbol_list),
-                chunk_size
-            ):
-
-                group = symbol_list[
-                    i:i + chunk_size
-                ]
-
-                topic = (
-                    "/market/match:"
-                    + ",".join(group)
-                )
-
-                msg = {
-                    "id": str(
-                        int(
-                            time.time()
-                            * 1000
-                        )
-                    ),
-                    "type": "subscribe",
-                    "topic": topic,
-                    "privateChannel": False,
-                    "response": True
-                }
-
-                ws.send(
-                    json.dumps(msg)
-                )
-
-            print(
-                "Subscribed:",
-                len(symbol_list)
-            )
-
-        def on_message(
-            ws,
-            message
-        ):
-
-            try:
-
-                data = json.loads(
-                    message
-                )
-
-                if data.get(
-                    "type"
-                ) != "message":
-                    return
-
-                d = data.get(
-                    "data",
-                    {}
-                )
-
-                symbol = d.get(
-                    "symbol"
-                )
-
-                side = d.get(
-                    "side"
-                )
-
-                price = d.get(
-                    "price"
-                )
-
-                size = d.get(
-                    "size"
-                )
-
-                if not all([
-                    symbol,
-                    side,
-                    price,
-                    size
-                ]):
-                    return
-
-                price = float(price)
-                size = float(size)
-
-                usd = price * size
-
-                trades[symbol].append({
-                    "time": time.time(),
-                    "side": side.lower(),
-                    "usd": usd
-                })
-
-                if (
-                    side.lower() == "buy"
-                    and usd >= MIN_BUY_USD
-                ):
-
-                    print(
-                        "BUY",
-                        symbol,
-                        "$",
-                        round(usd, 2)
-                    )
-
-                    check_signal(
-                        symbol
-                    )
-
-            except Exception as e:
-
-                print(
-                    "Message error:",
-                    e
-                )
-
-        def on_error(
-            ws,
-            error
-        ):
-
-            print(
-                "WebSocket error:",
-                error
-            )
-
-        def on_close(
-            ws,
-            code,
-            msg
-        ):
-
-            print(
-                "WebSocket closed:",
-                code,
-                msg
-            )
-
-        try:
-
-            ws = websocket.WebSocketApp(
-                url,
-                on_open=on_open,
-                on_message=on_message,
-                on_error=on_error,
-                on_close=on_close
-            )
-
-            ws.run_forever(
-                ping_interval=15,
-                ping_timeout=10
-            )
-
-        except Exception as e:
-
-            print(
-                "WebSocket run error:",
-                e
-            )
-
-        print(
-            "Reconnect in 10 seconds..."
-        )
-
-        time.sleep(10)
-
-
-# ==============================
-# STRUCTURE REFRESH
-# ==============================
-
-def structure_loop(symbols):
-
-    while True:
-
-        print(
-            "Updating today's structures..."
-        )
-
-        for symbol in symbols:
-
-            try:
-
-                s = build_structure(
-                    symbol
-                )
-
-                if s:
-
-                    today_structure[
-                        symbol
-                    ] = s
-
-            except Exception:
-                pass
-
-            time.sleep(0.10)
-
-        print(
-            "Structure update complete."
-        )
-
-        # Refresh every 15 minutes
-        time.sleep(900)
-
-
-# ==============================
-# MAIN
-# ==============================
 
 def main():
-
-    print(
-        "======================================"
-    )
-
-    print(
-        " KUCOIN SECOND MOVE SETUP BOT"
-    )
-
-    print(
-        "======================================"
-    )
-
     if not TOKEN or not CHAT_ID:
+        raise RuntimeError("Set TELEGRAM_TOKEN and CHAT_ID in GitHub Secrets.")
 
-        print(
-            "Telegram secrets missing"
-        )
+    state = load_state()
+    st_coins = get_st_coins()
+    gainers, currency_info = fetch_market_data()
+    off_coins = fully_deposit_off(currency_info)
 
-        return
+    # Do not include ST-tagged coins anywhere in alerts/watchlist.
+    gainers = [c for c in gainers if c["base"] not in st_coins]
+    top_gainers = gainers[:30]
+    top_narratives = {}
+    for coin in top_gainers:
+        narrative = classify_narrative(coin["name"], coin["base"])
+        if narrative != "UNKNOWN":
+            top_narratives[narrative] = top_narratives.get(narrative, 0) + 1
 
-    symbols = get_symbols()
+    active_narratives = {
+        category for category, count in top_narratives.items() if count >= 2
+    }
+    if not active_narratives and top_narratives:
+        active_narratives = {max(top_narratives, key=top_narratives.get)}
 
-    if not symbols:
-        return
-
-    # Build structures
-    print(
-        "Building today's buying zones..."
-    )
-
-    for symbol in symbols:
-
-        try:
-
-            s = build_structure(
-                symbol
+    # Alert only when a symbol newly crosses +100%; reset after it falls below +95%.
+    currently_above = {c["base"] for c in gainers if c["change"] >= 100}
+    previous_above = set(state.get("above_100", []))
+    for coin in gainers:
+        if coin["change"] >= 100 and coin["base"] not in previous_above:
+            narrative = classify_narrative(coin["name"], coin["base"])
+            telegram(
+                "🚀 KUCOIN +100% TOP GAINER\n"
+                f"{coin['pair']} | 24H: +{coin['change']:.1f}%\n"
+                f"Narrative: {narrative}\n"
+                f"24H turnover: ${coin['volume_usd']:,.0f}\n"
+                "⚠️ Momentum alert only—not a buy signal."
             )
+    state["above_100"] = sorted(
+        currently_above | {x for x in previous_above if x in currently_above}
+    )
 
-            if s:
+    # Match fully deposit-off coins against currently active top-gainer narratives.
+    by_base = {c["base"]: c for c in gainers}
+    watch = []
+    for base in off_coins:
+        if base in st_coins or base not in by_base:
+            continue
+        coin = by_base[base]
+        narrative = classify_narrative(coin["name"], base)
+        if narrative in active_narratives:
+            watch.append((coin, narrative))
+    watch.sort(key=lambda x: x[0]["volume_usd"], reverse=True)
+    watch = watch[:20]
 
-                today_structure[
-                    symbol
-                ] = s
+    new_watch = []
+    prior_watch = set(state.get("watchlist", []))
+    current_watch = {coin["base"] for coin, _ in watch}
+    for coin, narrative in watch:
+        if coin["base"] not in prior_watch:
+            new_watch.append((coin, narrative))
+    if new_watch:
+        lines = ["🔎 DEPOSIT-OFF / SAME-NARRATIVE WATCHLIST"]
+        lines.append("Active top-gainer trend: " + ", ".join(sorted(active_narratives)))
+        for coin, narrative in new_watch[:12]:
+            lines.append(
+                f"• {coin['pair']} | {narrative} | 24H {coin['change']:+.1f}% "
+                f"| turnover ${coin['volume_usd']:,.0f}"
+            )
+        lines.append("ST coins excluded. Watchlist ≠ buy recommendation.")
+        telegram("\n".join(lines))
+    state["watchlist"] = sorted(current_watch)
 
-        except Exception:
-            pass
+    # Technical confirmation alerts, limited to the highest-turnover watchlist coins.
+    setup_alerts = state.get("setup_alerts", {})
+    for coin, narrative in watch[:12]:
+        try:
+            ready, reason = setup_check(coin)
+        except Exception as exc:
+            print(f"Candle check failed for {coin['pair']}: {exc}")
+            continue
+        now = int(time.time())
+        last_alert = int(setup_alerts.get(coin["base"], 0) or 0)
+        if ready and now - last_alert >= 6 * 3600:
+            telegram(
+                "🚨 DEPOSIT-OFF RETEST SETUP\n"
+                f"{coin['pair']} | Narrative: {narrative}\n"
+                f"24H change: {coin['change']:+.1f}%\n"
+                f"Price: {coin['price']}\n"
+                f"Confirmation: {reason}\n"
+                "⚠️ High risk; verify liquidity and news before trading."
+            )
+            setup_alerts[coin["base"]] = now
+    state["setup_alerts"] = setup_alerts
 
-        time.sleep(0.10)
+    # One daily trend summary (UTC date) to avoid Telegram spam.
+    today = datetime.now(timezone.utc).date().isoformat()
+    if state.get("daily_summary_date") != today:
+        lines = ["📊 KUCOIN DAILY TREND (UTC)", "Top gainers:"]
+        for coin in top_gainers[:10]:
+            narrative = classify_narrative(coin["name"], coin["base"])
+            lines.append(f"• {coin['pair']} {coin['change']:+.1f}% | {narrative}")
+        lines.append("Active narrative(s): " + (", ".join(sorted(active_narratives)) or "Not clear"))
+        lines.append(f"Fully deposit-off coins matched to active narrative: {len(watch)}")
+        lines.append("ST-tag filter: best-effort auto-detection + optional ST_COINS list.")
+        telegram("\n".join(lines))
+        state["daily_summary_date"] = today
 
+    save_state(state)
     print(
-        "Buying zones:",
-        len(today_structure)
-    )
-
-    # Refresh structure in background
-    thread = threading.Thread(
-        target=structure_loop,
-        args=(symbols,),
-        daemon=True
-    )
-
-    thread.start()
-
-    # Live buying monitor
-    run_websocket(
-        symbols
+        f"Done. top_gainers={len(top_gainers)}, fully_off={len(off_coins)}, "
+        f"active_narratives={sorted(active_narratives)}, watchlist={len(watch)}"
     )
 
 
