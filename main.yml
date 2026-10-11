@@ -1,42 +1,38 @@
-name: KuCoin Daily 2nd-Move Retest Scanner
+name: KuCoin Narrative Watchlist
 
 on:
   workflow_dispatch:
-
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "*/10 * * * *"
 
 permissions:
   contents: write
 
 jobs:
-  monitor:
+  scan:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 5
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run Daily Retest Scanner
+        run: pip install requests
+      - name: Run KuCoin scanner
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
+          ST_COINS: ${{ vars.ST_COINS }}
         run: python monitor.py
-
       - name: Save alert state
         run: |
-          if [ -f alert_state.json ]; then
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add alert_state.json
-            git diff --cached --quiet || git commit -m "Update alert state"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update KuCoin alert state"
             git push
           fi
