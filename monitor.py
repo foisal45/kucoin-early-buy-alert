@@ -167,29 +167,96 @@ def get_candles(pair, candle_type, limit=100):
     return sorted(candles, key=lambda x: x["time"])
 
 
+
+def orderbook_check(pair):
+    """Approximate near-book sell pressure; walls can be spoofed and are not proof of bots."""
+    data = get_json("/api/v3/market/orderbook/level2_20", {"symbol": pair}) or {}
+    bids = data.get("bids") or []
+    asks = data.get("asks") or []
+    if not bids or not asks:
+        return None, "order book unavailable"
+
+    # Compare quote notional (price * size) in the first 20 levels.
+    bid_value = sum(float(x[0]) * float(x[1]) for x in bids if len(x) >= 2)
+    ask_value = sum(float(x[0]) * float(x[1]) for x in asks if len(x) >= 2)
+    total = bid_value + ask_value
+    if total <= 0:
+        return None, "order book empty"
+    ask_ratio = ask_value / max(bid_value, 1e-12)
+    bid_share = bid_value / total * 100
+    if ask_ratio >= 1.8:
+        return -2, f"sell pressure high (asks/bids {ask_ratio:.2f}x)"
+    if ask_ratio >= 1.3:
+        return -1, f"sell pressure elevated (asks/bids {ask_ratio:.2f}x)"
+    if bid_share >= 58:
+        return 2, f"buy-side depth stronger ({bid_share:.0f}%)"
+    if bid_share >= 52:
+        return 1, f"buy-side depth slightly stronger ({bid_share:.0f}%)"
+    return 0, f"order book balanced (bid depth {bid_share:.0f}%)"
+
 def setup_check(coin):
-    """Conservative heuristic: 1H structure + green 15m candle/volume + near 24h low."""
+    """Score an early entry: 1H structure, 15m volume, and a pullback zone."""
     pair = coin["pair"]
-    hourly = get_candles(pair, "1hour", 12)
+    hourly = get_candles(pair, "1hour", 36)
     fifteen = get_candles(pair, "15min", 100)
-    if len(hourly) < 7 or len(fifteen) < 9:
-        return False, "Not enough candles"
+    if len(hourly) < 12 or len(fifteen) < 20:
+        return 0, ["insufficient candles"]
 
+    score, reasons = 0, []
+    h = hourly[-1]
     h_closes = [c["close"] for c in hourly]
-    h_avg = sum(h_closes[-6:]) / 6
-    h_ok = h_closes[-1] > h_avg and h_closes[-1] >= h_closes[-2]
+    avg6 = sum(h_closes[-6:]) / 6
+    # Prefer improving hourly structure without requiring a late breakout.
+    if h_closes[-1] >= h_closes[-2] and h_closes[-1] >= avg6:
+        score += 2
+        reasons.append("1H structure improving")
+    if h["close"] > h["open"]:
+        score += 1
+        reasons.append("1H candle green")
 
-    latest = fifteen[-1]
+    last = fifteen[-1]
     prior_vols = [c["volume"] for c in fifteen[-9:-1]]
     avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
-    m15_ok = latest["close"] > latest["open"] and avg_vol > 0 and latest["volume"] >= avg_vol * 1.2
+    if avg_vol > 0 and last["volume"] >= avg_vol * 1.2:
+        score += 2
+        reasons.append("15M volume rising")
+    if last["close"] >= last["open"]:
+        score += 1
+        reasons.append("15M candle green")
 
-    # Current price should remain within +15% of 24h low, matching the requested retest zone.
-    low_24h = min(c["low"] for c in fifteen[-96:]) if len(fifteen) >= 96 else min(c["low"] for c in fifteen)
-    near_low = coin["price"] > 0 and coin["price"] <= low_24h * 1.15
-    if h_ok and m15_ok and near_low:
-        return True, "1H trend + 15M green/volume + near-low retest"
-    return False, "Waiting for confirmation"
+    recent = fifteen[-96:] if len(fifteen) >= 96 else fifteen
+    low_24h = min(c["low"] for c in recent)
+    high_24h = max(c["high"] for c in recent)
+    price = coin["price"]
+    above_low = ((price / low_24h) - 1) * 100 if low_24h > 0 else 999
+    below_high = ((high_24h / price) - 1) * 100 if price > 0 else 0
+    # Favor a retest near the low; avoid chasing near the 24h high.
+    if 0 <= above_low <= 15:
+        score += 2
+        reasons.append(f"near 24H low (+{above_low:.1f}%)")
+    elif below_high >= 8:
+        score += 1
+        reasons.append("not at 24H high")
+    else:
+        reasons.append("near 24H high—avoid chasing")
+
+    # Penalize a sharp 24h move so the scanner doesn't chase an already-pumped coin.
+    if coin["change"] >= 80:
+        score -= 2
+        reasons.append("already pumped hard")
+
+    # Reject obvious sell-heavy books. This is a snapshot, not reliable bot detection.
+    try:
+        book_score, book_reason = orderbook_check(pair)
+        reasons.append(book_reason)
+        if book_score is not None:
+            score += book_score
+            if book_score <= -2:
+                reasons.append("sell-pressure veto")
+    except Exception as exc:
+        print(f"Order book check failed for {pair}: {exc}")
+        reasons.append("order book unavailable")
+    return score, reasons
 
 
 def main():
@@ -233,55 +300,80 @@ def main():
         currently_above | {x for x in previous_above if x in currently_above}
     )
 
-    # Match fully deposit-off coins against currently active top-gainer narratives.
+    # Candidate pool: deposit-off coins among top gainers, with narrative matches ranked first.
+    # Market cap is not consistently available from KuCoin public APIs; avoid obvious large caps
+    # and very high-turnover pairs, but do not pretend this proves <$650K market cap.
+    LARGE_CAPS = {"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "TRX", "TON", "LINK", "AVAX", "DOT", "LTC", "BCH", "SUI", "XLM", "SHIB", "PEPE"}
+    top_gainers = gainers[:100]
     by_base = {c["base"]: c for c in gainers}
     watch = []
     for base in off_coins:
-        if base in st_coins or base not in by_base:
+        if base in st_coins or base in LARGE_CAPS or base not in by_base:
             continue
         coin = by_base[base]
+        # Exclude obvious large/liquid coins as call candidates; turnover is only a proxy.
+        if coin["volume_usd"] > 10_000_000:
+            continue
         narrative = classify_narrative(coin["name"], base)
-        if narrative in active_narratives:
-            watch.append((coin, narrative))
-    watch.sort(key=lambda x: x[0]["volume_usd"], reverse=True)
-    watch = watch[:20]
+        same_narrative = narrative in active_narratives
+        top_rank = next((i + 1 for i, item in enumerate(top_gainers) if item["base"] == base), 999)
+        # Include deposit-off top-gainers even if their narrative doesn't match the active theme.
+        if same_narrative or top_rank <= 30:
+            watch.append({"coin": coin, "narrative": narrative, "same_narrative": same_narrative, "top_rank": top_rank})
 
+    # First evaluate technical setup; sort by confluence, narrative match, rank, and turnover.
+    evaluated = []
+    for item in watch:
+        try:
+            score, reasons = setup_check(item["coin"])
+            item["score"] = score
+            item["reasons"] = reasons
+            evaluated.append(item)
+        except Exception as exc:
+            print(f"Candle check failed for {item['coin']['pair']}: {exc}")
+    evaluated.sort(key=lambda x: (x["score"], x["same_narrative"], -x["top_rank"], x["coin"]["volume_usd"]), reverse=True)
+    watch = evaluated[:20]
+
+    # Daily shortlist of up to 6 best candidates, not a promise that 6 valid setups exist.
     new_watch = []
     prior_watch = set(state.get("watchlist", []))
-    current_watch = {coin["base"] for coin, _ in watch}
-    for coin, narrative in watch:
-        if coin["base"] not in prior_watch:
-            new_watch.append((coin, narrative))
+    current_watch = {item["coin"]["base"] for item in watch}
+    for item in watch:
+        if item["coin"]["base"] not in prior_watch:
+            new_watch.append(item)
     if new_watch:
-        lines = ["🔎 DEPOSIT-OFF / SAME-NARRATIVE WATCHLIST"]
-        lines.append("Active top-gainer trend: " + ", ".join(sorted(active_narratives)))
-        for coin, narrative in new_watch[:12]:
-            lines.append(
-                f"• {coin['pair']} | {narrative} | 24H {coin['change']:+.1f}% "
-                f"| turnover ${coin['volume_usd']:,.0f}"
-            )
-        lines.append("ST coins excluded. Watchlist ≠ buy recommendation.")
+        lines = ["🔎 DEPOSIT-OFF / NARRATIVE WATCHLIST"]
+        lines.append("Top-gainer narrative(s): " + (", ".join(sorted(active_narratives)) or "unclear"))
+        for item in new_watch[:6]:
+            coin = item["coin"]
+            lines.append(f"• {coin['pair']} | {item['narrative']} | 24H {coin['change']:+.1f}% | Top gainers #{item['top_rank']} | score {item['score']}/8")
+        lines.append("Market cap is not verified by KuCoin API; big/liquid coins are filtered conservatively.")
         telegram("\n".join(lines))
     state["watchlist"] = sorted(current_watch)
 
-    # Technical confirmation alerts, limited to the highest-turnover watchlist coins.
+    # Alert the best qualifying setups. Avoid repeating the same coin more than every 6 hours.
     setup_alerts = state.get("setup_alerts", {})
-    for coin, narrative in watch[:12]:
-        try:
-            ready, reason = setup_check(coin)
-        except Exception as exc:
-            print(f"Candle check failed for {coin['pair']}: {exc}")
-            continue
+    ready_items = [
+        item for item in watch
+        if item["score"] >= 5
+        and not any("near 24H high—avoid chasing" in r for r in item["reasons"])
+        and not any("sell-pressure veto" in r for r in item["reasons"])
+    ]
+    ready_items = ready_items[:6]
+    for item in ready_items:
+        coin = item["coin"]
         now = int(time.time())
         last_alert = int(setup_alerts.get(coin["base"], 0) or 0)
-        if ready and now - last_alert >= 6 * 3600:
+        if now - last_alert >= 6 * 3600:
+            match_text = "same narrative" if item["same_narrative"] else "deposit-off top gainer"
             telegram(
-                "🚨 DEPOSIT-OFF RETEST SETUP\n"
-                f"{coin['pair']} | Narrative: {narrative}\n"
-                f"24H change: {coin['change']:+.1f}%\n"
-                f"Price: {coin['price']}\n"
-                f"Confirmation: {reason}\n"
-                "⚠️ High risk; verify liquidity and news before trading."
+                "🚨 TOP URGENT SETUP\n"
+                f"{coin['pair']} | {item['narrative']}\n"
+                f"24H: {coin['change']:+.1f}% | Top gainer #{item['top_rank']}\n"
+                f"Price: {coin['price']} | Setup score: {item['score']} (chart + order book)\n"
+                f"Why: {', '.join(item['reasons'])}\n"
+                f"Context: deposit OFF + {match_text}\n"
+                "⚠️ Deposit OFF is not a buy signal; verify liquidity/news. No return guarantee."
             )
             setup_alerts[coin["base"]] = now
     state["setup_alerts"] = setup_alerts
@@ -294,7 +386,7 @@ def main():
             narrative = classify_narrative(coin["name"], coin["base"])
             lines.append(f"• {coin['pair']} {coin['change']:+.1f}% | {narrative}")
         lines.append("Active narrative(s): " + (", ".join(sorted(active_narratives)) or "Not clear"))
-        lines.append(f"Fully deposit-off coins matched to active narrative: {len(watch)}")
+        lines.append(f"Deposit-off candidates scored: {len(watch)} | shortlist target: up to 6")
         lines.append("ST-tag filter: best-effort auto-detection + optional ST_COINS list.")
         telegram("\n".join(lines))
         state["daily_summary_date"] = today
