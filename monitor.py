@@ -255,7 +255,19 @@ def setup_check(coin):
                 reasons.append("sell-pressure veto")
     except Exception as exc:
         print(f"Order book check failed for {pair}: {exc}")
-        reasons.append("order book unavailable")
+        return -99, ["order book unavailable—skip"]
+    if book_score is None:
+        return -99, [book_reason + "—skip"]
+    # A setup must show an actual 15M volume pickup and be near the 24H low.
+    if not any("15M volume rising" in r for r in reasons):
+        return -99, reasons + ["no 15M volume confirmation—skip"]
+    if not any("near 24H low" in r for r in reasons):
+        return -99, reasons + ["not in low retest zone—skip"]
+    # Avoid bearish 15M candle with a large upper wick (possible rejection).
+    candle_range = max(last["high"] - last["low"], 1e-12)
+    upper_wick = last["high"] - max(last["open"], last["close"])
+    if last["close"] < last["open"] and upper_wick / candle_range >= 0.45:
+        return -99, reasons + ["15M sell rejection—skip"]
     return score, reasons
 
 
@@ -334,21 +346,8 @@ def main():
     evaluated.sort(key=lambda x: (x["score"], x["same_narrative"], -x["top_rank"], x["coin"]["volume_usd"]), reverse=True)
     watch = evaluated[:20]
 
-    # Daily shortlist of up to 6 best candidates, not a promise that 6 valid setups exist.
-    new_watch = []
-    prior_watch = set(state.get("watchlist", []))
+    # Keep state quietly; do not send a separate watchlist message.
     current_watch = {item["coin"]["base"] for item in watch}
-    for item in watch:
-        if item["coin"]["base"] not in prior_watch:
-            new_watch.append(item)
-    if new_watch:
-        lines = ["🔎 DEPOSIT-OFF / NARRATIVE WATCHLIST"]
-        lines.append("Top-gainer narrative(s): " + (", ".join(sorted(active_narratives)) or "unclear"))
-        for item in new_watch[:6]:
-            coin = item["coin"]
-            lines.append(f"• {coin['pair']} | {item['narrative']} | 24H {coin['change']:+.1f}% | Top gainers #{item['top_rank']} | score {item['score']}/8")
-        lines.append("Market cap is not verified by KuCoin API; big/liquid coins are filtered conservatively.")
-        telegram("\n".join(lines))
     state["watchlist"] = sorted(current_watch)
 
     # Alert the best qualifying setups. Avoid repeating the same coin more than every 6 hours.
@@ -356,8 +355,10 @@ def main():
     ready_items = [
         item for item in watch
         if item["score"] >= 5
-        and not any("near 24H high—avoid chasing" in r for r in item["reasons"])
-        and not any("sell-pressure veto" in r for r in item["reasons"])
+        and not any(("skip" in r or "sell-pressure veto" in r or "near 24H high—avoid chasing" in r) for r in item["reasons"])
+        and any("15M volume rising" in r for r in item["reasons"])
+        and any("near 24H low" in r for r in item["reasons"])
+        and not any("order book unavailable" in r or "order book empty" in r for r in item["reasons"])
     ]
     ready_items = ready_items[:6]
     for item in ready_items:
@@ -366,30 +367,18 @@ def main():
         last_alert = int(setup_alerts.get(coin["base"], 0) or 0)
         if now - last_alert >= 6 * 3600:
             match_text = "same narrative" if item["same_narrative"] else "deposit-off top gainer"
+            short_reasons = [r for r in item["reasons"] if r.startswith(("1H structure", "15M volume", "near 24H low", "buy-side depth"))]
             telegram(
-                "🚨 TOP URGENT SETUP\n"
+                "🚨 EARLY BUY SETUP\n"
                 f"{coin['pair']} | {item['narrative']}\n"
-                f"24H: {coin['change']:+.1f}% | Top gainer #{item['top_rank']}\n"
-                f"Price: {coin['price']} | Setup score: {item['score']} (chart + order book)\n"
-                f"Why: {', '.join(item['reasons'])}\n"
-                f"Context: deposit OFF + {match_text}\n"
-                "⚠️ Deposit OFF is not a buy signal; verify liquidity/news. No return guarantee."
+                f"Price: {coin['price']} | Score: {item['score']}\n"
+                f"24H: {coin['change']:+.1f}% | Low-zone retest\n"
+                f"Confirm: {', '.join(short_reasons)}\n"
+                f"Context: Deposit OFF + {match_text}\n"
+                "⚠️ Heuristic only; not a guaranteed buy signal."
             )
             setup_alerts[coin["base"]] = now
     state["setup_alerts"] = setup_alerts
-
-    # One daily trend summary (UTC date) to avoid Telegram spam.
-    today = datetime.now(timezone.utc).date().isoformat()
-    if state.get("daily_summary_date") != today:
-        lines = ["📊 KUCOIN DAILY TREND (UTC)", "Top gainers:"]
-        for coin in top_gainers[:10]:
-            narrative = classify_narrative(coin["name"], coin["base"])
-            lines.append(f"• {coin['pair']} {coin['change']:+.1f}% | {narrative}")
-        lines.append("Active narrative(s): " + (", ".join(sorted(active_narratives)) or "Not clear"))
-        lines.append(f"Deposit-off candidates scored: {len(watch)} | shortlist target: up to 6")
-        lines.append("ST-tag filter: best-effort auto-detection + optional ST_COINS list.")
-        telegram("\n".join(lines))
-        state["daily_summary_date"] = today
 
     save_state(state)
     print(
