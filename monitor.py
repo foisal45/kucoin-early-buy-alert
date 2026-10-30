@@ -1,389 +1,690 @@
+
 import os
-import json
 import re
+import json
+import html
 import time
+import logging
 from datetime import datetime, timezone
-from pathlib import Path
 
 import requests
 
-API = "https://api.kucoin.com"
-TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+# ================= CONFIG =================
+
+BASE = "https://api.kucoin.com"
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 CHAT_ID = os.getenv("CHAT_ID", "").strip()
-STATE_FILE = Path("state.json")
-TIMEOUT = 15
 
-# Add/adjust mappings as needed. Automatic narrative detection is heuristic,
-# because KuCoin's public ticker API does not provide a reliable narrative field.
-NARRATIVE_KEYWORDS = {
-    "AI": ["artificial intelligence", " ai ", "ai agent", "ai"],
-    "MEME": ["meme", "doge", "shib", "inu", "pepe", "bonk", "floki", "wif"],
-    "GAMING": ["gaming", "game", "metaverse", "play to earn", "p2e"],
-    "DEFI": ["defi", "decentralized finance", "lending", "yield", "dex"],
-    "RWA": ["real world asset", " rwa ", "tokenized asset"],
-    "LAYER 1": ["layer 1", "layer-1", "blockchain", "smart contract"],
-    "LAYER 2": ["layer 2", "layer-2", "rollup", "scaling"],
-    "DEPIN": ["depin", "decentralized physical infrastructure"],
-    "AI / DEPIN": ["depin", "artificial intelligence"],
-}
-
-# Optional manual ST list: set GitHub secret/variable ST_COINS="ABC,XYZ"
-MANUAL_ST = {
+ST_COINS = {
     x.strip().upper()
     for x in os.getenv("ST_COINS", "").split(",")
     if x.strip()
 }
 
+STATE_FILE = "state.json"
+
+MIN_24H_TURNOVER = 100000
+MIN_15M_TURNOVER = 10000
+MIN_VOLUME_RATIO = 2.0
+MAX_24H_CHANGE = 12.0
+MAX_1H_CHANGE = 3.5
+MAX_NEWS_AGE_HOURS = 72
+
+MAX_MARKETS_TO_CHECK = 40
+MAX_SIGNALS_PER_RUN = 5
+
+POSITIVE_WORDS = [
+    "partnership", "partnered", "integration", "integrates",
+    "launches", "launch", "mainnet", "upgrade", "ecosystem",
+    "funding", "investment", "funded", "burn", "buyback",
+    "adoption", "support", "collaboration", "expansion",
+    "staking", "gempool", "campaign"
+]
+
+NEGATIVE_WORDS = [
+    "delist", "delisting", "suspend", "suspension",
+    "maintenance", "will close", "close deposit",
+    "close withdrawal", "risk warning", "warning",
+    "hack", "exploit", "incident", "investigation"
+]
+
+LISTING_WORDS = [
+    "gets listed", "will be listed", "new listing",
+    "listing on kucoin", "world premiere"
+]
+
 session = requests.Session()
-session.headers.update({"User-Agent": "KuCoin-Narrative-Watchlist/1.0"})
+session.headers.update({"User-Agent": "KuCoin-Early-Buy-Scanner/1.0"})
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s"
+)
 
 
-def get_json(path, params=None):
-    response = session.get(API + path, params=params, timeout=TIMEOUT)
+# ================= BASIC HELPERS =================
+
+def api_get(path, params=None):
+    response = session.get(
+        BASE + path,
+        params=params,
+        timeout=15
+    )
     response.raise_for_status()
-    payload = response.json()
-    if payload.get("code") != "200000":
-        raise RuntimeError(f"KuCoin API error at {path}: {payload.get('msg')}")
-    return payload.get("data")
+
+    result = response.json()
+
+    if result.get("code") != "200000":
+        raise RuntimeError(f"KuCoin API error: {result}")
+
+    return result.get("data", {})
+
+
+def number(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def load_state():
     try:
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {"above_100": [], "watchlist": [], "setup_alerts": {}, "daily_summary_date": ""}
+        with open(STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
 
 
 def save_state(state):
-    STATE_FILE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    # Keep the state file small
+    state["sent"] = state.get("sent", [])[-500:]
+
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2)
 
 
-def telegram(message):
-    if not TOKEN or not CHAT_ID:
-        raise RuntimeError("Missing TELEGRAM_TOKEN or CHAT_ID GitHub secret.")
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    response = session.post(
-        url,
-        json={"chat_id": CHAT_ID, "text": message, "disable_web_page_preview": True},
-        timeout=TIMEOUT,
+def send_telegram(message):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        logging.error("Telegram secrets missing")
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+
+    try:
+        response = session.post(
+            url,
+            data={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            },
+            timeout=15
+        )
+        response.raise_for_status()
+
+        result = response.json()
+        if not result.get("ok"):
+            logging.error("Telegram error: %s", result)
+            return False
+
+        return True
+
+    except requests.RequestException as exc:
+        logging.error("Telegram send failed: %s", exc)
+        return False
+
+
+# ================= KUCOIN MARKET DATA =================
+
+def get_symbols():
+    data = api_get("/api/v2/symbols")
+    return data if isinstance(data, list) else []
+
+
+def get_tickers():
+    data = api_get("/api/v1/market/allTickers")
+    return data.get("ticker", [])
+
+
+def get_announcements():
+    data = api_get(
+        "/api/v3/announcements",
+        {
+            "currentPage": 1,
+            "pageSize": 100,
+            "annType": "latest-announcements",
+            "lang": "en_US"
+        }
     )
-    response.raise_for_status()
-    result = response.json()
-    if not result.get("ok"):
-        raise RuntimeError(f"Telegram API error: {result}")
+    return data.get("items", [])
 
 
-def get_st_coins():
-    """Best-effort auto-detection from recent KuCoin announcements + manual list."""
-    st = set(MANUAL_ST)
-    terms = ("st tag", "special treatment", "st-tag", "will add st")
-    for page in range(1, 4):
-        try:
-            data = get_json(
-                "/api/v3/announcements",
-                {"currentPage": page, "pageSize": 100, "annType": "latest-announcements", "lang": "en_US"},
-            )
-            for item in (data or {}).get("items", []):
-                title = str(item.get("annTitle", ""))
-                desc = str(item.get("annDesc", ""))
-                combined = (title + " " + desc).lower()
-                if any(term in combined for term in terms):
-                    # Extract likely tickers shown in parentheses, e.g. Token (ABC).
-                    for match in re.findall(r"\(([A-Z0-9]{2,15})\)", title + " " + desc):
-                        st.add(match.upper())
-        except Exception as exc:
-            print(f"ST announcement scan warning: {exc}")
-            break
-    return st
+def get_candles(symbol):
+    data = api_get(
+        "/api/v1/market/candles",
+        {"symbol": symbol, "type": "15min"}
+    )
 
+    if not isinstance(data, list):
+        return []
 
-def classify_narrative(name, symbol):
-    text = f" {name or ''} {symbol or ''} ".lower()
-    # More specific category first.
-    for category in ("AI / DEPIN", "AI", "MEME", "GAMING", "DEFI", "RWA", "LAYER 2", "LAYER 1", "DEPIN"):
-        if any(word in text for word in NARRATIVE_KEYWORDS[category]):
-            return category
-    return "UNKNOWN"
+    candles = []
 
-
-def fetch_market_data():
-    tickers = get_json("/api/v1/market/allTickers")["ticker"]
-    symbols = get_json("/api/v2/symbols")
-    currencies = get_json("/api/v3/currencies")
-
-    symbol_info = {
-        s.get("symbol"): s for s in symbols
-        if s.get("quoteCurrency") == "USDT" and s.get("enableTrading", True)
-    }
-    currency_info = {c.get("currency"): c for c in currencies if c.get("currency")}
-    usdt = []
-    for ticker in tickers:
-        pair = ticker.get("symbol", "")
-        if not pair.endswith("-USDT") or pair not in symbol_info:
+    for row in data:
+        if len(row) < 7:
             continue
-        try:
-            change = float(ticker.get("changeRate") or 0) * 100
-            volume_usd = float(ticker.get("volValue") or 0)
-            price = float(ticker.get("last") or 0)
-        except (TypeError, ValueError):
-            continue
-        base = pair[:-5]
-        info = symbol_info[pair]
-        currency = currency_info.get(base, {})
-        full_name = currency.get("fullName") or currency.get("name") or base
-        usdt.append({
-            "pair": pair, "base": base, "change": change, "volume_usd": volume_usd,
-            "price": price, "name": full_name, "symbol_info": info,
+
+        candles.append({
+            "time": int(row[0]),
+            "open": number(row[1]),
+            "close": number(row[2]),
+            "high": number(row[3]),
+            "low": number(row[4]),
+            "volume": number(row[5]),
+            "turnover": number(row[6])
         })
-    usdt.sort(key=lambda x: x["change"], reverse=True)
-    return usdt, currency_info
+
+    candles.sort(key=lambda x: x["time"])
+    return candles
 
 
-def fully_deposit_off(currency_info):
-    """True only when every listed network is explicitly deposit-disabled."""
-    result = set()
-    for code, info in currency_info.items():
-        chains = info.get("chains") or []
-        if chains and all(chain.get("isDepositEnabled") is False for chain in chains):
-            result.add(code.upper())
+def get_deposit_status(currency):
+    try:
+        data = api_get(f"/api/v3/currencies/{currency}")
+        chains = data.get("chains", [])
+
+        if not chains:
+            return "UNKNOWN"
+
+        # Deposit OFF only if every known network explicitly says OFF
+        statuses = [
+            chain.get("isDepositEnabled")
+            for chain in chains
+        ]
+
+        if statuses and all(status is False for status in statuses):
+            return "OFF"
+
+        if any(status is True for status in statuses):
+            return "ON"
+
+        return "UNKNOWN"
+
+    except Exception as exc:
+        logging.warning(
+            "Could not check deposit status for %s: %s",
+            currency, exc
+        )
+        return "UNKNOWN"
+
+
+# ================= NEWS FILTER =================
+
+def announcement_text(item):
+    title = item.get("annTitle", "")
+    description = item.get("annDesc", "")
+    return f"{title} {description}".lower()
+
+
+def is_new_listing(item):
+    text = announcement_text(item)
+    types = item.get("annType", [])
+
+    if isinstance(types, str):
+        types = [types]
+
+    if "new-listings" in types:
+        return True
+
+    return any(word in text for word in LISTING_WORDS)
+
+
+def coin_mentioned(item, symbol):
+    title = item.get("annTitle", "")
+    description = item.get("annDesc", "")
+    text = f"{title} {description}".upper()
+
+    # Prefer exact ticker references to reduce false matches
+    patterns = [
+        rf"\({re.escape(symbol)}\)",
+        rf"\${re.escape(symbol)}\b",
+        rf"\b{re.escape(symbol)}/USDT\b"
+    ]
+
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def find_positive_news(symbol, announcements):
+    now_ms = int(time.time() * 1000)
+
+    for item in announcements:
+        text = announcement_text(item)
+
+        if is_new_listing(item):
+            continue
+
+        if any(word in text for word in NEGATIVE_WORDS):
+            continue
+
+        if not any(word in text for word in POSITIVE_WORDS):
+            continue
+
+        if not coin_mentioned(item, symbol):
+            continue
+
+        published = number(item.get("cTime"))
+
+        if published:
+            age_hours = (now_ms - published) / 3600000
+            if age_hours < 0 or age_hours > MAX_NEWS_AGE_HOURS:
+                continue
+        else:
+            continue
+
+        title = item.get("annTitle", "KuCoin announcement")
+        url = item.get("annUrl", "")
+
+        if not url.startswith("https://www.kucoin.com/"):
+            continue
+
+        return {
+            "title": title,
+            "url": url,
+            "age_hours": age_hours,
+            "id": str(item.get("annId", ""))
+        }
+
+    return None
+
+
+# ================= TECHNICAL ANALYSIS =================
+
+def ema(values, period):
+    if len(values) < period:
+        return []
+
+    multiplier = 2 / (period + 1)
+    result = [sum(values[:period]) / period]
+
+    for value in values[period:]:
+        result.append(
+            (value - result[-1]) * multiplier + result[-1]
+        )
+
     return result
 
 
-def get_candles(pair, candle_type, limit=100):
-    data = get_json(
-        "/api/v1/market/candles",
-        {"symbol": pair, "type": candle_type},
+def rsi(values, period=14):
+    if len(values) < period + 1:
+        return None
+
+    gains = []
+    losses = []
+
+    for i in range(1, len(values)):
+        change = values[i] - values[i - 1]
+        gains.append(max(change, 0))
+        losses.append(max(-change, 0))
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+        avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def macd_histogram(values):
+    fast = ema(values, 12)
+    slow = ema(values, 26)
+
+    if not fast or not slow:
+        return None, None
+
+    # Align EMA arrays by their original candle positions
+    offset = 26 - 12
+    macd_line = [
+        fast[i + offset] - slow[i]
+        for i in range(len(slow))
+    ]
+
+    signal = ema(macd_line, 9)
+
+    if len(signal) < 2:
+        return None, None
+
+    hist = [
+        macd_line[i + (len(macd_line) - len(signal))]
+        - signal[i]
+        for i in range(len(signal))
+    ]
+
+    return hist[-1], hist[-2]
+
+
+def analyse_market(symbol):
+    candles = get_candles(symbol)
+
+    # The newest candle may still be forming; use completed candles
+    if len(candles) < 60:
+        return None
+
+    completed = candles[:-1]
+
+    if len(completed) < 55:
+        return None
+
+    closes = [c["close"] for c in completed]
+    highs = [c["high"] for c in completed]
+    lows = [c["low"] for c in completed]
+
+    last = completed[-1]
+    previous = completed[-2]
+
+    ema20_series = ema(closes, 20)
+    ema50_series = ema(closes, 50)
+
+    if not ema20_series or not ema50_series:
+        return None
+
+    ema20 = ema20_series[-1]
+    ema50 = ema50_series[-1]
+    current_rsi = rsi(closes)
+
+    macd_now, macd_previous = macd_histogram(closes)
+
+    if current_rsi is None or macd_now is None:
+        return None
+
+    # Last completed 15m candle compared with the previous 20 candles
+    previous_volumes = [
+        c["turnover"] for c in completed[-21:-1]
+    ]
+
+    avg_turnover = (
+        sum(previous_volumes) / len(previous_volumes)
+        if previous_volumes else 0
     )
-    # KuCoin returns newest-first: [time, open, close, high, low, volume, turnover].
-    candles = []
-    for row in (data or [])[:limit]:
-        try:
-            candles.append({
-                "time": int(row[0]), "open": float(row[1]), "close": float(row[2]),
-                "high": float(row[3]), "low": float(row[4]), "volume": float(row[5]),
-            })
-        except (TypeError, ValueError, IndexError):
+
+    volume_ratio = (
+        last["turnover"] / avg_turnover
+        if avg_turnover > 0 else 0
+    )
+
+    # Price movement over the last four completed 15m candles
+    old_price = completed[-5]["close"]
+    change_1h = (
+        ((last["close"] - old_price) / old_price) * 100
+        if old_price else 0
+    )
+
+    # Recent support and resistance
+    support = min(lows[-20:])
+    resistance = max(highs[-20:])
+
+    # Simple ATR estimate
+    true_ranges = []
+
+    for i in range(1, len(completed)):
+        candle = completed[i]
+        previous_close = completed[i - 1]["close"]
+
+        true_ranges.append(max(
+            candle["high"] - candle["low"],
+            abs(candle["high"] - previous_close),
+            abs(candle["low"] - previous_close)
+        ))
+
+    atr = (
+        sum(true_ranges[-14:]) / 14
+        if len(true_ranges) >= 14 else 0
+    )
+
+    technical_checks = {
+        "volume": volume_ratio >= MIN_VOLUME_RATIO,
+        "price_not_pumped": change_1h <= MAX_1H_CHANGE,
+        "ema": last["close"] > ema20 and ema20 > ema50,
+        "rsi": 50 <= current_rsi <= 68,
+        "macd": macd_now > 0 and macd_now > macd_previous,
+        "turnover": last["turnover"] >= MIN_15M_TURNOVER
+    }
+
+    passed = sum(technical_checks.values())
+
+    if passed < 6:
+        return None
+
+    if support <= 0 or atr <= 0:
+        return None
+
+    # Entry near current market price; risk levels use ATR/support
+    entry_low = last["close"] * 0.997
+    entry_high = last["close"] * 1.003
+
+    stop = min(
+        support - (0.25 * atr),
+        entry_low - (1.5 * atr)
+    )
+
+    risk = entry_high - stop
+
+    if risk <= 0:
+        return None
+
+    target1 = entry_high + (1.5 * risk)
+    target2 = entry_high + (2.5 * risk)
+
+    return {
+        "price": last["close"],
+        "volume_ratio": volume_ratio,
+        "change_1h": change_1h,
+        "rsi": current_rsi,
+        "ema20": ema20,
+        "ema50": ema50,
+        "macd": macd_now,
+        "support": support,
+        "resistance": resistance,
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "stop": stop,
+        "target1": target1,
+        "target2": target2,
+        "checks": technical_checks
+    }
+
+
+# ================= SCANNER =================
+
+def build_market_list(symbols, tickers):
+    active = {
+        item["symbol"]: item
+        for item in symbols
+        if item.get("quoteCurrency") == "USDT"
+        and item.get("enableTrading") is True
+        and item.get("symbol")
+    }
+
+    markets = []
+
+    for ticker in tickers:
+        symbol = ticker.get("symbol", "")
+
+        if symbol not in active:
             continue
-    return sorted(candles, key=lambda x: x["time"])
+
+        base = active[symbol].get("baseCurrency", "")
+
+        if not base or base in ST_COINS:
+            continue
+
+        change = number(ticker.get("changeRate")) * 100
+        turnover = number(ticker.get("volValue"))
+
+        if change > MAX_24H_CHANGE or change < -8:
+            continue
+
+        if turnover < MIN_24H_TURNOVER:
+            continue
+
+        markets.append({
+            "symbol": symbol,
+            "base": base,
+            "price": number(ticker.get("last")),
+            "change": change,
+            "turnover": turnover
+        })
+
+    markets.sort(
+        key=lambda x: x["turnover"],
+        reverse=True
+    )
+
+    return markets[:MAX_MARKETS_TO_CHECK]
 
 
+def format_price(value):
+    if value >= 100:
+        return f"{value:.4f}"
+    if value >= 1:
+        return f"{value:.6f}"
+    return f"{value:.8f}".rstrip("0").rstrip(".")
 
-def orderbook_check(pair):
-    """Approximate near-book sell pressure; walls can be spoofed and are not proof of bots."""
-    data = get_json("/api/v3/market/orderbook/level2_20", {"symbol": pair}) or {}
-    bids = data.get("bids") or []
-    asks = data.get("asks") or []
-    if not bids or not asks:
-        return None, "order book unavailable"
 
-    # Compare quote notional (price * size) in the first 20 levels.
-    bid_value = sum(float(x[0]) * float(x[1]) for x in bids if len(x) >= 2)
-    ask_value = sum(float(x[0]) * float(x[1]) for x in asks if len(x) >= 2)
-    total = bid_value + ask_value
-    if total <= 0:
-        return None, "order book empty"
-    ask_ratio = ask_value / max(bid_value, 1e-12)
-    bid_share = bid_value / total * 100
-    if ask_ratio >= 1.8:
-        return -2, f"sell pressure high (asks/bids {ask_ratio:.2f}x)"
-    if ask_ratio >= 1.3:
-        return -1, f"sell pressure elevated (asks/bids {ask_ratio:.2f}x)"
-    if bid_share >= 58:
-        return 2, f"buy-side depth stronger ({bid_share:.0f}%)"
-    if bid_share >= 52:
-        return 1, f"buy-side depth slightly stronger ({bid_share:.0f}%)"
-    return 0, f"order book balanced (bid depth {bid_share:.0f}%)"
+def make_alert(market, news, analysis, deposit):
+    symbol = market["symbol"]
+    base = market["base"]
 
-def setup_check(coin):
-    """Score an early entry: 1H structure, 15m volume, and a pullback zone."""
-    pair = coin["pair"]
-    hourly = get_candles(pair, "1hour", 36)
-    fifteen = get_candles(pair, "15min", 100)
-    if len(hourly) < 12 or len(fifteen) < 20:
-        return 0, ["insufficient candles"]
+    deposit_text = {
+        "OFF": "🔴 OFF — priority",
+        "ON": "🟢 ON",
+        "UNKNOWN": "⚪ Unknown"
+    }.get(deposit, "⚪ Unknown")
 
-    score, reasons = 0, []
-    h = hourly[-1]
-    h_closes = [c["close"] for c in hourly]
-    avg6 = sum(h_closes[-6:]) / 6
-    # Prefer improving hourly structure without requiring a late breakout.
-    if h_closes[-1] >= h_closes[-2] and h_closes[-1] >= avg6:
-        score += 2
-        reasons.append("1H structure improving")
-    if h["close"] > h["open"]:
-        score += 1
-        reasons.append("1H candle green")
+    checks = analysis["checks"]
 
-    last = fifteen[-1]
-    prior_vols = [c["volume"] for c in fifteen[-9:-1]]
-    avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
-    if avg_vol > 0 and last["volume"] >= avg_vol * 1.2:
-        score += 2
-        reasons.append("15M volume rising")
-    if last["close"] >= last["open"]:
-        score += 1
-        reasons.append("15M candle green")
+    passed_names = [
+        name.upper()
+        for name, passed in checks.items()
+        if passed
+    ]
 
-    recent = fifteen[-96:] if len(fifteen) >= 96 else fifteen
-    low_24h = min(c["low"] for c in recent)
-    high_24h = max(c["high"] for c in recent)
-    price = coin["price"]
-    above_low = ((price / low_24h) - 1) * 100 if low_24h > 0 else 999
-    below_high = ((high_24h / price) - 1) * 100 if price > 0 else 0
-    # Favor a retest near the low; avoid chasing near the 24h high.
-    if 0 <= above_low <= 15:
-        score += 2
-        reasons.append(f"near 24H low (+{above_low:.1f}%)")
-    elif below_high >= 8:
-        score += 1
-        reasons.append("not at 24H high")
-    else:
-        reasons.append("near 24H high—avoid chasing")
+    message = (
+        "🚨 <b>KUCOIN EARLY BUY SETUP</b>\n\n"
+        f"🪙 <b>Coin:</b> {html.escape(symbol)}\n"
+        f"💰 <b>Price:</b> {format_price(analysis['price'])}\n"
+        f"📊 <b>24H Change:</b> {market['change']:.2f}%\n"
+        f"📈 <b>15m Volume:</b> {analysis['volume_ratio']:.2f}x average\n"
+        f"⏱ <b>1H Price Change:</b> {analysis['change_1h']:.2f}%\n"
+        f"📥 <b>Deposit:</b> {deposit_text}\n\n"
+        "📰 <b>Official KuCoin News</b>\n"
+        f"{html.escape(news['title'])}\n"
+        f"<a href=\"{html.escape(news['url'], quote=True)}\">Open news source</a>\n"
+        f"News age: {news['age_hours']:.1f} hours\n\n"
+        "📉 <b>Technical Confirmation</b>\n"
+        f"RSI: {analysis['rsi']:.1f}\n"
+        f"EMA20: {format_price(analysis['ema20'])}\n"
+        f"EMA50: {format_price(analysis['ema50'])}\n"
+        f"MACD histogram: {analysis['macd']:.8f}\n"
+        f"Support: {format_price(analysis['support'])}\n"
+        f"Resistance: {format_price(analysis['resistance'])}\n"
+        f"Passed: {', '.join(passed_names)}\n\n"
+        "🎯 <b>Trade Plan (estimated)</b>\n"
+        f"Entry: {format_price(analysis['entry_low'])}"
+        f" - {format_price(analysis['entry_high'])}\n"
+        f"Target 1: {format_price(analysis['target1'])}\n"
+        f"Target 2: {format_price(analysis['target2'])}\n"
+        f"Stop Loss: {format_price(analysis['stop'])}\n\n"
+        "⚠️ Signal is not a guarantee. Verify liquidity, spread and news "
+        "before trading. Entry/targets are calculated estimates, not "
+        "financial advice."
+    )
 
-    # Penalize a sharp 24h move so the scanner doesn't chase an already-pumped coin.
-    if coin["change"] >= 80:
-        score -= 2
-        reasons.append("already pumped hard")
-
-    # Reject obvious sell-heavy books. This is a snapshot, not reliable bot detection.
-    try:
-        book_score, book_reason = orderbook_check(pair)
-        reasons.append(book_reason)
-        if book_score is not None:
-            score += book_score
-            if book_score <= -2:
-                reasons.append("sell-pressure veto")
-    except Exception as exc:
-        print(f"Order book check failed for {pair}: {exc}")
-        return -99, ["order book unavailable—skip"]
-    if book_score is None:
-        return -99, [book_reason + "—skip"]
-    # A setup must show an actual 15M volume pickup and be near the 24H low.
-    if not any("15M volume rising" in r for r in reasons):
-        return -99, reasons + ["no 15M volume confirmation—skip"]
-    if not any("near 24H low" in r for r in reasons):
-        return -99, reasons + ["not in low retest zone—skip"]
-    # Avoid bearish 15M candle with a large upper wick (possible rejection).
-    candle_range = max(last["high"] - last["low"], 1e-12)
-    upper_wick = last["high"] - max(last["open"], last["close"])
-    if last["close"] < last["open"] and upper_wick / candle_range >= 0.45:
-        return -99, reasons + ["15M sell rejection—skip"]
-    return score, reasons
+    return message
 
 
 def main():
-    if not TOKEN or not CHAT_ID:
-        raise RuntimeError("Set TELEGRAM_TOKEN and CHAT_ID in GitHub Secrets.")
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        raise RuntimeError("TELEGRAM_TOKEN or CHAT_ID is missing")
+
+    logging.info("Starting KuCoin early-buy scanner")
 
     state = load_state()
-    st_coins = get_st_coins()
-    gainers, currency_info = fetch_market_data()
-    off_coins = fully_deposit_off(currency_info)
+    sent = set(state.get("sent", []))
 
-    # Do not include ST-tagged coins anywhere in alerts/watchlist.
-    gainers = [c for c in gainers if c["base"] not in st_coins]
-    top_gainers = gainers[:30]
-    top_narratives = {}
-    for coin in top_gainers:
-        narrative = classify_narrative(coin["name"], coin["base"])
-        if narrative != "UNKNOWN":
-            top_narratives[narrative] = top_narratives.get(narrative, 0) + 1
+    symbols = get_symbols()
+    tickers = get_tickers()
+    announcements = get_announcements()
 
-    active_narratives = {
-        category for category, count in top_narratives.items() if count >= 2
-    }
-    if not active_narratives and top_narratives:
-        active_narratives = {max(top_narratives, key=top_narratives.get)}
+    markets = build_market_list(symbols, tickers)
 
-    # Alert only when a symbol newly crosses +100%; reset after it falls below +95%.
-    currently_above = {c["base"] for c in gainers if c["change"] >= 100}
-    previous_above = set(state.get("above_100", []))
-    for coin in gainers:
-        if coin["change"] >= 100 and coin["base"] not in previous_above:
-            narrative = classify_narrative(coin["name"], coin["base"])
-            telegram(
-                "🚀 KUCOIN +100% TOP GAINER\n"
-                f"{coin['pair']} | 24H: +{coin['change']:.1f}%\n"
-                f"Narrative: {narrative}\n"
-                f"24H turnover: ${coin['volume_usd']:,.0f}\n"
-                "⚠️ Momentum alert only—not a buy signal."
-            )
-    state["above_100"] = sorted(
-        currently_above | {x for x in previous_above if x in currently_above}
-    )
+    logging.info("Markets selected: %d", len(markets))
 
-    # Candidate pool: deposit-off coins among top gainers, with narrative matches ranked first.
-    # Market cap is not consistently available from KuCoin public APIs; avoid obvious large caps
-    # and very high-turnover pairs, but do not pretend this proves <$650K market cap.
-    LARGE_CAPS = {"BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "TRX", "TON", "LINK", "AVAX", "DOT", "LTC", "BCH", "SUI", "XLM", "SHIB", "PEPE"}
-    top_gainers = gainers[:100]
-    by_base = {c["base"]: c for c in gainers}
-    watch = []
-    for base in off_coins:
-        if base in st_coins or base in LARGE_CAPS or base not in by_base:
-            continue
-        coin = by_base[base]
-        # Exclude obvious large/liquid coins as call candidates; turnover is only a proxy.
-        if coin["volume_usd"] > 10_000_000:
-            continue
-        narrative = classify_narrative(coin["name"], base)
-        same_narrative = narrative in active_narratives
-        top_rank = next((i + 1 for i, item in enumerate(top_gainers) if item["base"] == base), 999)
-        # Include deposit-off top-gainers even if their narrative doesn't match the active theme.
-        if same_narrative or top_rank <= 30:
-            watch.append({"coin": coin, "narrative": narrative, "same_narrative": same_narrative, "top_rank": top_rank})
+    sent_this_run = 0
 
-    # First evaluate technical setup; sort by confluence, narrative match, rank, and turnover.
-    evaluated = []
-    for item in watch:
+    for market in markets:
+        if sent_this_run >= MAX_SIGNALS_PER_RUN:
+            break
+
+        symbol = market["symbol"]
+        base = market["base"]
+
         try:
-            score, reasons = setup_check(item["coin"])
-            item["score"] = score
-            item["reasons"] = reasons
-            evaluated.append(item)
-        except Exception as exc:
-            print(f"Candle check failed for {item['coin']['pair']}: {exc}")
-    evaluated.sort(key=lambda x: (x["score"], x["same_narrative"], -x["top_rank"], x["coin"]["volume_usd"]), reverse=True)
-    watch = evaluated[:20]
+            news = find_positive_news(base, announcements)
 
-    # Keep state quietly; do not send a separate watchlist message.
-    current_watch = {item["coin"]["base"] for item in watch}
-    state["watchlist"] = sorted(current_watch)
+            if not news:
+                continue
 
-    # Alert the best qualifying setups. Avoid repeating the same coin more than every 6 hours.
-    setup_alerts = state.get("setup_alerts", {})
-    ready_items = [
-        item for item in watch
-        if item["score"] >= 5
-        and not any(("skip" in r or "sell-pressure veto" in r or "near 24H high—avoid chasing" in r) for r in item["reasons"])
-        and any("15M volume rising" in r for r in item["reasons"])
-        and any("near 24H low" in r for r in item["reasons"])
-        and not any("order book unavailable" in r or "order book empty" in r for r in item["reasons"])
-    ]
-    ready_items = ready_items[:6]
-    for item in ready_items:
-        coin = item["coin"]
-        now = int(time.time())
-        last_alert = int(setup_alerts.get(coin["base"], 0) or 0)
-        if now - last_alert >= 6 * 3600:
-            match_text = "same narrative" if item["same_narrative"] else "deposit-off top gainer"
-            short_reasons = [r for r in item["reasons"] if r.startswith(("1H structure", "15M volume", "near 24H low", "buy-side depth"))]
-            telegram(
-                "🚨 EARLY BUY SETUP\n"
-                f"{coin['pair']} | {item['narrative']}\n"
-                f"Price: {coin['price']} | Score: {item['score']}\n"
-                f"24H: {coin['change']:+.1f}% | Low-zone retest\n"
-                f"Confirm: {', '.join(short_reasons)}\n"
-                f"Context: Deposit OFF + {match_text}\n"
-                "⚠️ Heuristic only; not a guaranteed buy signal."
+            analysis = analyse_market(symbol)
+
+            if not analysis:
+                continue
+
+            alert_id = f"{symbol}:{news['id']}"
+
+            if alert_id in sent:
+                continue
+
+            deposit = get_deposit_status(base)
+
+            message = make_alert(
+                market,
+                news,
+                analysis,
+                deposit
             )
-            setup_alerts[coin["base"]] = now
-    state["setup_alerts"] = setup_alerts
+
+            if send_telegram(message):
+                sent.add(alert_id)
+                sent_this_run += 1
+
+                logging.info("Alert sent: %s", symbol)
+
+            time.sleep(0.25)
+
+        except Exception as exc:
+            logging.exception(
+                "Error scanning %s: %s",
+                symbol, exc
+            )
+
+    state["sent"] = list(sent)[-500:]
+    state["last_scan_utc"] = datetime.now(
+        timezone.utc
+    ).isoformat()
 
     save_state(state)
-    print(
-        f"Done. top_gainers={len(top_gainers)}, fully_off={len(off_coins)}, "
-        f"active_narratives={sorted(active_narratives)}, watchlist={len(watch)}"
+
+    logging.info(
+        "Scan complete. Alerts sent: %d",
+        sent_this_run
     )
 
 
