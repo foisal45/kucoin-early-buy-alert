@@ -1,4 +1,5 @@
-name: KuCoin Narrative Watchlist
+
+name: KuCoin Early Buy Scanner
 
 on:
   workflow_dispatch:
@@ -11,22 +12,27 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - name: Install dependencies
-        run: pip install requests
+        run: pip install -r requirements.txt
+
       - name: Run KuCoin scanner
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHAT_ID: ${{ secrets.CHAT_ID }}
           ST_COINS: ${{ vars.ST_COINS }}
         run: python monitor.py
+
       - name: Save alert state
         run: |
           git config user.name "github-actions[bot]"
