@@ -15,29 +15,50 @@ MAX_COINS = 40
 MAX_PRICE_CHANGE = 15
 
 session = requests.Session()
-session.headers.update({"User-Agent": "KuCoin-Smart-Scanner/1.0"})
+session.headers.update({
+    "User-Agent": "KuCoin-Smart-Scanner/2.0"
+})
 
 
 def api(path, params=None):
     try:
-        r = session.get(BASE + path, params=params, timeout=15)
-        r.raise_for_status()
+        r = session.get(
+            BASE + path,
+            params=params,
+            timeout=15
+        )
+
+        if r.status_code != 200:
+            print(
+                "API error:",
+                path,
+                r.status_code,
+                r.text[:300]
+            )
+            return None
+
         data = r.json()
+
         if data.get("code") == "200000":
             return data.get("data")
+
+        print("KuCoin API response error:", data)
+        return None
+
     except Exception as e:
         print("API error:", path, e)
-    return None
+        return None
 
 
 def telegram(message):
     if not TOKEN or not CHAT_ID:
         print("Missing TELEGRAM_TOKEN or CHAT_ID")
-        return
+        return False
 
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+
     try:
-        requests.post(
+        r = requests.post(
             url,
             data={
                 "chat_id": CHAT_ID,
@@ -46,9 +67,19 @@ def telegram(message):
                 "disable_web_page_preview": True
             },
             timeout=15
-        ).raise_for_status()
+        )
+
+        result = r.json()
+
+        if not result.get("ok"):
+            print("Telegram response error:", result)
+            return False
+
+        return True
+
     except Exception as e:
         print("Telegram error:", e)
+        return False
 
 
 def load_state():
@@ -56,7 +87,10 @@ def load_state():
         with open(STATE_FILE, "r") as f:
             return json.load(f)
     except Exception:
-        return {"alerts": [], "daily_report": ""}
+        return {
+            "alerts": [],
+            "daily_report": ""
+        }
 
 
 def save_state(state):
@@ -73,18 +107,23 @@ def deposit_off_currencies():
 
     for coin in currencies:
         chains = coin.get("chains") or []
+
         if not chains:
             continue
 
-        # Only mark OFF when every listed network is disabled.
-        if all(c.get("isDepositEnabled") is False for c in chains):
+        if all(
+            chain.get("isDepositEnabled") is False
+            for chain in chains
+        ):
             result.add(coin.get("currency"))
 
+    print("Deposit-OFF currencies:", len(result))
     return result
 
 
 def get_tickers():
     data = api("/api/v1/market/allTickers")
+
     if not data:
         return []
 
@@ -99,7 +138,10 @@ def ema(values, period):
     multiplier = 2 / (period + 1)
 
     for value in values[1:]:
-        result = (value * multiplier) + (result * (1 - multiplier))
+        result = (
+            value * multiplier
+            + result * (1 - multiplier)
+        )
 
     return result
 
@@ -123,22 +165,27 @@ def rsi(values, period=14):
         return 100
 
     rs = avg_gain / avg_loss
+
     return 100 - (100 / (1 + rs))
 
 
 def get_candles(symbol):
     data = api(
         "/api/v1/market/candles",
-        {"symbol": symbol, "type": "1hour"}
+        {
+            "symbol": symbol,
+            "type": "1hour"
+        }
     )
 
     if not data:
         return []
 
-    candles = sorted(data, key=lambda x: int(x[0]))
+    candles = sorted(
+        data,
+        key=lambda x: int(x[0])
+    )
 
-    # KuCoin candle order:
-    # time, open, close, high, low, volume, turnover
     return candles
 
 
@@ -148,7 +195,7 @@ def analyze(symbol):
     if len(candles) < 55:
         return None
 
-    # Ignore the currently forming candle.
+    # Ignore currently forming candle
     candles = candles[:-1]
 
     closes = [float(c[2]) for c in candles]
@@ -162,7 +209,9 @@ def analyze(symbol):
     if old_price <= 0:
         return None
 
-    change = ((price - old_price) / old_price) * 100
+    change = (
+        (price - old_price) / old_price
+    ) * 100
 
     if change < -35 or change >= MAX_PRICE_CHANGE:
         return None
@@ -177,18 +226,19 @@ def analyze(symbol):
 
     ema20 = ema(closes[-60:], 20)
     ema50 = ema(closes[-100:], 50)
+
     current_rsi = rsi(closes)
 
     ema12 = ema(closes[-60:], 12)
     ema26 = ema(closes[-60:], 26)
 
     macd_bullish = (
-        ema12 is not None and
-        ema26 is not None and
-        ema12 > ema26
+        ema12 is not None
+        and ema26 is not None
+        and ema12 > ema26
     )
 
-    # Recent trade history: indicative only, not complete market flow.
+    # Recent trades
     trades = api(
         "/api/v1/market/histories",
         {"symbol": symbol}
@@ -198,18 +248,27 @@ def analyze(symbol):
     sell_volume = 0
 
     for trade in trades:
-        size = float(trade.get("size", 0))
-        if trade.get("side") == "buy":
-            buy_volume += size
-        else:
-            sell_volume += size
+        try:
+            size = float(trade.get("size", 0))
+
+            if trade.get("side") == "buy":
+                buy_volume += size
+            else:
+                sell_volume += size
+
+        except Exception:
+            continue
 
     total = buy_volume + sell_volume
-    buy_ratio = buy_volume / total if total else 0
 
-    # Order book snapshot
+    buy_ratio = (
+        buy_volume / total
+        if total > 0 else 0
+    )
+
+    # FIXED ORDER BOOK ENDPOINT
     orderbook = api(
-        "/api/v3/market/orderbook/level2_20",
+        "/api/v1/market/orderbook/level2_20",
         {"symbol": symbol}
     )
 
@@ -220,14 +279,18 @@ def analyze(symbol):
         asks = orderbook.get("asks", [])
 
         bid_value = sum(
-            float(x[0]) * float(x[1]) for x in bids
+            float(x[0]) * float(x[1])
+            for x in bids
         )
+
         ask_value = sum(
-            float(x[0]) * float(x[1]) for x in asks
+            float(x[0]) * float(x[1])
+            for x in asks
         )
 
         total_book = bid_value + ask_value
-        if total_book:
+
+        if total_book > 0:
             bid_ratio = bid_value / total_book
 
     score = 0
@@ -261,30 +324,31 @@ def analyze(symbol):
         score += 10
         reasons.append("MACD bullish")
 
-    if price > ema20:
+    if ema20 and price > ema20:
         score += 5
         reasons.append("Above EMA20")
 
     signal = None
 
     if (
-        volume_ratio >= 1.5 and
-        -8 <= change <= 0 and
-        buy_ratio >= 0.52 and
-        bid_ratio >= 0.50
+        volume_ratio >= 1.5
+        and -8 <= change <= 0
+        and buy_ratio >= 0.52
+        and bid_ratio >= 0.50
     ):
         signal = "ACCUMULATION WATCH"
 
     elif (
-        ema20 and ema50 and
-        ema20 > ema50 and
-        price > ema20 and
-        macd_bullish and
-        current_rsi and
-        50 <= current_rsi <= 72 and
-        buy_ratio >= 0.58 and
-        bid_ratio >= 0.55 and
-        volume_ratio >= 1.15
+        ema20
+        and ema50
+        and ema20 > ema50
+        and price > ema20
+        and macd_bullish
+        and current_rsi
+        and 50 <= current_rsi <= 72
+        and buy_ratio >= 0.58
+        and bid_ratio >= 0.55
+        and volume_ratio >= 1.15
     ):
         signal = "BULLISH"
 
@@ -309,24 +373,40 @@ def news_alert(state):
     data = api("/api/v3/announcements")
 
     if not data:
+        print("News API unavailable")
         return
 
-    items = data.get("items", []) if isinstance(data, dict) else []
+    items = (
+        data.get("items", [])
+        if isinstance(data, dict)
+        else []
+    )
 
     positive = [
-        "listing", "launch", "partnership", "upgrade",
-        "mainnet", "integration", "support"
+        "listing",
+        "launch",
+        "partnership",
+        "upgrade",
+        "mainnet",
+        "integration",
+        "support"
     ]
 
     negative = [
-        "delist", "suspend", "maintenance",
-        "withdrawal suspended", "deposit suspended"
+        "delist",
+        "suspend",
+        "maintenance",
+        "withdrawal suspended",
+        "deposit suspended"
     ]
 
     for item in items[:20]:
         title = item.get("title", "")
         url = item.get("url", "")
-        key = str(item.get("annId") or title)
+
+        key = str(
+            item.get("annId") or title
+        )
 
         if key in state["alerts"]:
             continue
@@ -334,22 +414,28 @@ def news_alert(state):
         lower = title.lower()
 
         if any(word in lower for word in positive):
-            telegram(
+            sent = telegram(
                 "📰 <b>KuCoin Positive News Watch</b>\n\n"
                 f"{title}\n{url}"
             )
-            state["alerts"].append(key)
+
+            if sent:
+                state["alerts"].append(key)
 
         elif any(word in lower for word in negative):
-            telegram(
+            sent = telegram(
                 "⚠️ <b>KuCoin Important Announcement</b>\n\n"
                 f"{title}\n{url}"
             )
-            state["alerts"].append(key)
+
+            if sent:
+                state["alerts"].append(key)
 
 
 def daily_report(results, state):
-    today = datetime.now(timezone.utc).date().isoformat()
+    today = datetime.now(
+        timezone.utc
+    ).date().isoformat()
 
     if state.get("daily_report") == today:
         return
@@ -365,19 +451,23 @@ def daily_report(results, state):
             "📊 <b>Daily Deposit-OFF Watchlist</b>\n\n"
             "আজ কোনো শক্তিশালী signal পাওয়া যায়নি।"
         )
+
     else:
-        message = "📊 <b>Daily Deposit-OFF Watchlist</b>\n\n"
+        message = (
+            "📊 <b>Daily Deposit-OFF Watchlist</b>\n\n"
+        )
 
         for item in top:
             message += (
-                f"• <b>{item['symbol']}</b> | "
+                f"• <b>{item['symbol']}</b>\n"
                 f"Score: {item['score']}/100\n"
-                f"Price change: {item['change']:.2f}% | "
-                f"Volume: {item['volume_ratio']:.2f}x\n\n"
+                f"Price change: {item['change']:.2f}%\n"
+                f"Volume: {item['volume_ratio']:.2f}x\n"
+                f"RSI: {item['rsi']:.1f}\n\n"
             )
 
-    telegram(message)
-    state["daily_report"] = today
+    if telegram(message):
+        state["daily_report"] = today
 
 
 def main():
@@ -385,11 +475,15 @@ def main():
 
     print("Starting KuCoin Smart Scanner...")
 
+    if not TOKEN or not CHAT_ID:
+        print("Telegram secrets missing!")
+        return
+
     off_coins = deposit_off_currencies()
     tickers = get_tickers()
 
     if not off_coins or not tickers:
-        print("No currency/ticker data. Check API.")
+        print("Currency or ticker data unavailable.")
         return
 
     candidates = []
@@ -406,16 +500,33 @@ def main():
             continue
 
         try:
-            change = float(ticker.get("changeRate", 0)) * 100
-            volume = float(ticker.get("volValue", 0))
+            change = (
+                float(ticker.get("changeRate", 0)) * 100
+            )
 
-            if -8 <= change < MAX_PRICE_CHANGE and volume > 0:
-                candidates.append((symbol, volume))
+            volume = float(
+                ticker.get("volValue", 0)
+            )
+
+            if (
+                -8 <= change < MAX_PRICE_CHANGE
+                and volume > 0
+            ):
+                candidates.append(
+                    (symbol, volume)
+                )
+
         except Exception:
             continue
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
+    candidates.sort(
+        key=lambda x: x[1],
+        reverse=True
+    )
+
     candidates = candidates[:MAX_COINS]
+
+    print("Candidates:", len(candidates))
 
     results = []
 
@@ -428,9 +539,11 @@ def main():
         results.append(result)
 
         key = (
-            result["symbol"] + "_" +
-            result["signal"] + "_" +
-            str(datetime.now(timezone.utc).date())
+            result["symbol"]
+            + "_"
+            + result["signal"]
+            + "_"
+            + str(datetime.now(timezone.utc).date())
         )
 
         if key not in state["alerts"]:
@@ -448,16 +561,16 @@ def main():
                 "⚠️ Research alert, not a guaranteed buy signal."
             )
 
-            telegram(message)
-            state["alerts"].append(key)
+            if telegram(message):
+                state["alerts"].append(key)
 
         time.sleep(0.25)
 
     news_alert(state)
     daily_report(results, state)
 
-    # Keep state file from growing indefinitely.
     state["alerts"] = state["alerts"][-2000:]
+
     save_state(state)
 
     print("Scanner finished.")
