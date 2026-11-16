@@ -1,25 +1,21 @@
 
-name: KuCoin Smart Signal Scanner
+name: KuCoin Pump Dump Telegram Bot
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 */3 * * *"
+    - cron: "0 */6 * * *"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: kucoin-smart-scanner
-  cancel-in-progress: false
+  contents: read
 
 jobs:
-  scan:
+  run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 350
 
     steps:
-      - name: Checkout repository
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -27,21 +23,17 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install requirements
+      - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Scanner
+      - name: Run KuCoin Bot
         env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          CHANNEL_ID: ${{ secrets.CHAT_ID }}
+          API_KEY: ${{ secrets.API_KEY }}
+          API_SECRET: ${{ secrets.API_SECRET }}
+          API_PASSPHRASE: ${{ secrets.API_PASSPHRASE }}
+          API_IP: ${{ secrets.API_IP }}
         run: python monitor.py
-
-      - name: Save Scanner State
-        run: |
-          git config user.name "KuCoin Scanner"
-          git config user.email "scanner@users.noreply.github.com"
-          git add state.json
-          git diff --cached --quiet || git commit -m "Update scanner state"
-          git push
