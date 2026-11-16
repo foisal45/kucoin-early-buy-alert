@@ -9,13 +9,17 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: kucoin-pumpdump-bot
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350
 
     steps:
-      - name: Checkout Repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Python
@@ -23,17 +27,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install Dependencies
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run KuCoin Bot
+      - name: Start Bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           CHANNEL_ID: ${{ secrets.CHAT_ID }}
-          API_KEY: ${{ secrets.API_KEY }}
-          API_SECRET: ${{ secrets.API_SECRET }}
-          API_PASSPHRASE: ${{ secrets.API_PASSPHRASE }}
-          API_IP: ${{ secrets.API_IP }}
         run: python monitor.py
