@@ -1,580 +1,377 @@
 
 import os
-import json
-import time
+from dotenv import load_dotenv
 import requests
-from datetime import datetime, timezone
-from statistics import mean
+import time
+from datetime import datetime, timedelta
+import base64
+import hashlib
+import asyncio
+import hmac
+import telegram.error
+from telegram import Bot
+from telegram.error import RetryAfter
+import pandas as pd
+import pandas_ta as ta
 
-BASE = "https://api.kucoin.com"
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+# Settings
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHANNEL_ID = os.getenv("CHANNEL_ID")
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+API_PASSPHRASE = os.getenv("API_PASSPHRASE")
+API_IP = os.getenv("API_IP")
 
-STATE_FILE = "state.json"
-MAX_COINS = 40
-MAX_PRICE_CHANGE = 15
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "KuCoin-Smart-Scanner/2.0"
-})
+bot = Bot(token=TELEGRAM_BOT_TOKEN)
 
 
-def api(path, params=None):
+def get_headers(method, request_path, body=""):
+    timestamp = str(int(time.time() * 1000))
+    str_to_sign = timestamp + method + request_path + (body if body else "")
+
+    signature = base64.b64encode(
+        hmac.new(
+            API_SECRET.encode("utf-8"),
+            str_to_sign.encode("utf-8"),
+            hashlib.sha256
+        ).digest()
+    ).decode("utf-8")
+
+    passphrase = base64.b64encode(
+        hmac.new(
+            API_SECRET.encode("utf-8"),
+            API_PASSPHRASE.encode("utf-8"),
+            hashlib.sha256
+        ).digest()
+    ).decode("utf-8")
+
+    headers = {
+        "KC-API-SIGN": signature,
+        "KC-API-TIMESTAMP": timestamp,
+        "KC-API-KEY": API_KEY,
+        "KC-API-PASSPHRASE": passphrase,
+        "KC-API-KEY-VERSION": "2",
+    }
+    return headers
+
+
+def fetch_market_data():
+    url = "https://api.kucoin.com/api/v1/market/allTickers"
+
     try:
-        r = session.get(
-            BASE + path,
-            params=params,
-            timeout=15
+        response = requests.get(
+            url, headers=get_headers("GET", "/api/v1/market/allTickers")
         )
+        response.raise_for_status()
+        return response.json()
 
-        if r.status_code != 200:
-            print(
-                "API error:",
-                path,
-                r.status_code,
-                r.text[:300]
+    except requests.RequestException as e:
+        bot.send_message(chat_id=CHANNEL_ID, text=f"Error fetching data: {e}")
+        print(f"Error fetching data: {e}")
+        return None
+
+    except Exception as e:
+        bot.send_message(chat_id=CHANNEL_ID, text=f"Unexpected error: {e}")
+        print(f"Unexpected error: {e}")
+        return None
+
+
+def calculate_indicators(prices_history, minutes_to_evaluate=5, hours_for_trend=4):
+    current_time = datetime.now()
+    indicators = {}
+
+    evaluation_period = minutes_to_evaluate
+    trend_period = hours_for_trend * 60
+
+    for pair, prices in prices_history.items():
+        prices_df = pd.DataFrame(prices, columns=["price", "time"])
+        prices_df = prices_df.set_index("time")
+
+        prices_evaluation = prices_df.loc[
+            current_time - timedelta(minutes=evaluation_period): current_time, "price"
+        ]
+
+        prices_trend = prices_df.loc[
+            current_time - timedelta(minutes=evaluation_period + trend_period): current_time, "price"
+        ]
+
+        if len(prices_evaluation) >= 1 and len(prices_trend) >= 1:
+            rsi_evaluation = calculate_rsi(prices_evaluation)
+            rsi_trend = calculate_rsi(prices_trend)
+
+            macd_evaluation, signal_evaluation, hist_evaluation = calculate_macd(
+                prices_evaluation
             )
-            return None
 
-        data = r.json()
+            macd_trend, signal_trend, hist_trend = calculate_macd(prices_trend)
 
-        if data.get("code") == "200000":
-            return data.get("data")
+            indicators[pair] = {
+                "rsi_evaluation": rsi_evaluation,
+                "rsi_trend": rsi_trend,
+                "macd_evaluation": macd_evaluation,
+                "macd_trend": macd_trend,
+                "signal_evaluation": signal_evaluation,
+                "signal_trend": signal_trend,
+                "hist_evaluation": hist_evaluation,
+                "hist_trend": hist_trend,
+            }
+        else:
+            print(f"Error calculating indicators for {pair}")
 
-        print("KuCoin API response error:", data)
-        return None
-
-    except Exception as e:
-        print("API error:", path, e)
-        return None
-
-
-def telegram(message):
-    if not TOKEN or not CHAT_ID:
-        print("Missing TELEGRAM_TOKEN or CHAT_ID")
-        return False
-
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-
-    try:
-        r = requests.post(
-            url,
-            data={
-                "chat_id": CHAT_ID,
-                "text": message,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": True
-            },
-            timeout=15
-        )
-
-        result = r.json()
-
-        if not result.get("ok"):
-            print("Telegram response error:", result)
-            return False
-
-        return True
-
-    except Exception as e:
-        print("Telegram error:", e)
-        return False
+    return indicators
 
 
-def load_state():
-    try:
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {
-            "alerts": [],
-            "daily_report": ""
-        }
+def calculate_rsi(prices):
+    delta = prices.diff()
+    gain = (delta.where(delta > 0, 0)).mean()
+    loss = (-delta.where(delta < 0, 0)).mean()
 
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-
-
-def deposit_off_currencies():
-    currencies = api("/api/v3/currencies")
-    result = set()
-
-    if not currencies:
-        return result
-
-    for coin in currencies:
-        chains = coin.get("chains") or []
-
-        if not chains:
-            continue
-
-        if all(
-            chain.get("isDepositEnabled") is False
-            for chain in chains
-        ):
-            result.add(coin.get("currency"))
-
-    print("Deposit-OFF currencies:", len(result))
-    return result
-
-
-def get_tickers():
-    data = api("/api/v1/market/allTickers")
-
-    if not data:
-        return []
-
-    return data.get("ticker", [])
-
-
-def ema(values, period):
-    if len(values) < period:
-        return None
-
-    result = values[0]
-    multiplier = 2 / (period + 1)
-
-    for value in values[1:]:
-        result = (
-            value * multiplier
-            + result * (1 - multiplier)
-        )
-
-    return result
-
-
-def rsi(values, period=14):
-    if len(values) < period + 1:
-        return None
-
-    gains = []
-    losses = []
-
-    for i in range(1, len(values)):
-        change = values[i] - values[i - 1]
-        gains.append(max(change, 0))
-        losses.append(max(-change, 0))
-
-    avg_gain = mean(gains[-period:])
-    avg_loss = mean(losses[-period:])
-
-    if avg_loss == 0:
+    if loss == 0:
         return 100
 
-    rs = avg_gain / avg_loss
-
+    rs = gain / loss
     return 100 - (100 / (1 + rs))
 
 
-def get_candles(symbol):
-    data = api(
-        "/api/v1/market/candles",
-        {
-            "symbol": symbol,
-            "type": "1hour"
-        }
-    )
+def calculate_ema(prices, window):
+    weights = pd.Series(1.0, index=prices.index)
+    weights /= weights.sum()
+    ema = prices.ewm(span=window, min_periods=window).mean()
+    return ema
 
-    if not data:
-        return []
 
-    candles = sorted(
-        data,
-        key=lambda x: int(x[0])
-    )
+def calculate_macd(prices):
+    ema12 = calculate_ema(prices, 12)
+    ema26 = calculate_ema(prices, 26)
 
-    return candles
+    macd_line = ema12 - ema26
+    signal_line = calculate_ema(macd_line, 9)
+    histogram = macd_line - signal_line
 
+    return macd_line.iloc[-1], signal_line.iloc[-1], histogram.iloc[-1]
 
-def analyze(symbol):
-    candles = get_candles(symbol)
 
-    if len(candles) < 55:
-        return None
+async def send_telegram_message(chat_id, message):
+    try:
+        await bot.send_message(chat_id=chat_id, text=message, parse_mode="HTML")
 
-    # Ignore currently forming candle
-    candles = candles[:-1]
+    except telegram.error.RetryAfter as e:
+        print(f"Flood control exceeded. Retrying in {e.retry_after} seconds.")
+        await asyncio.sleep(e.retry_after)
+        await send_telegram_message(chat_id, message)
 
-    closes = [float(c[2]) for c in candles]
-    highs = [float(c[3]) for c in candles]
-    lows = [float(c[4]) for c in candles]
-    volumes = [float(c[5]) for c in candles]
-
-    price = closes[-1]
-    old_price = closes[-4]
-
-    if old_price <= 0:
-        return None
-
-    change = (
-        (price - old_price) / old_price
-    ) * 100
-
-    if change < -35 or change >= MAX_PRICE_CHANGE:
-        return None
-
-    recent_volume = mean(volumes[-3:])
-    previous_volume = mean(volumes[-6:-3])
-
-    if previous_volume <= 0:
-        return None
-
-    volume_ratio = recent_volume / previous_volume
-
-    ema20 = ema(closes[-60:], 20)
-    ema50 = ema(closes[-100:], 50)
-
-    current_rsi = rsi(closes)
-
-    ema12 = ema(closes[-60:], 12)
-    ema26 = ema(closes[-60:], 26)
-
-    macd_bullish = (
-        ema12 is not None
-        and ema26 is not None
-        and ema12 > ema26
-    )
-
-    # Recent trades
-    trades = api(
-        "/api/v1/market/histories",
-        {"symbol": symbol}
-    ) or []
-
-    buy_volume = 0
-    sell_volume = 0
-
-    for trade in trades:
-        try:
-            size = float(trade.get("size", 0))
-
-            if trade.get("side") == "buy":
-                buy_volume += size
-            else:
-                sell_volume += size
-
-        except Exception:
-            continue
-
-    total = buy_volume + sell_volume
-
-    buy_ratio = (
-        buy_volume / total
-        if total > 0 else 0
-    )
-
-    # FIXED ORDER BOOK ENDPOINT
-    orderbook = api(
-        "/api/v1/market/orderbook/level2_20",
-        {"symbol": symbol}
-    )
-
-    bid_ratio = 0
-
-    if orderbook:
-        bids = orderbook.get("bids", [])
-        asks = orderbook.get("asks", [])
-
-        bid_value = sum(
-            float(x[0]) * float(x[1])
-            for x in bids
-        )
-
-        ask_value = sum(
-            float(x[0]) * float(x[1])
-            for x in asks
-        )
-
-        total_book = bid_value + ask_value
-
-        if total_book > 0:
-            bid_ratio = bid_value / total_book
-
-    score = 0
-    reasons = []
-
-    if volume_ratio >= 1.5:
-        score += 20
-        reasons.append("Volume surge")
-
-    if change <= 0:
-        score += 15
-        reasons.append("Price not rising")
-
-    if buy_ratio >= 0.52:
-        score += 15
-        reasons.append("Buy pressure")
-
-    if bid_ratio >= 0.50:
-        score += 10
-        reasons.append("Bid support")
-
-    if ema20 and ema50 and ema20 > ema50:
-        score += 15
-        reasons.append("EMA bullish")
-
-    if current_rsi and 50 <= current_rsi <= 72:
-        score += 10
-        reasons.append("RSI bullish")
-
-    if macd_bullish:
-        score += 10
-        reasons.append("MACD bullish")
-
-    if ema20 and price > ema20:
-        score += 5
-        reasons.append("Above EMA20")
-
-    signal = None
-
-    if (
-        volume_ratio >= 1.5
-        and -8 <= change <= 0
-        and buy_ratio >= 0.52
-        and bid_ratio >= 0.50
-    ):
-        signal = "ACCUMULATION WATCH"
-
-    elif (
-        ema20
-        and ema50
-        and ema20 > ema50
-        and price > ema20
-        and macd_bullish
-        and current_rsi
-        and 50 <= current_rsi <= 72
-        and buy_ratio >= 0.58
-        and bid_ratio >= 0.55
-        and volume_ratio >= 1.15
-    ):
-        signal = "BULLISH"
-
-    if not signal:
-        return None
-
-    return {
-        "symbol": symbol,
-        "price": price,
-        "change": change,
-        "volume_ratio": volume_ratio,
-        "rsi": current_rsi,
-        "buy_ratio": buy_ratio,
-        "bid_ratio": bid_ratio,
-        "score": score,
-        "signal": signal,
-        "reasons": reasons
-    }
-
-
-def news_alert(state):
-    data = api("/api/v3/announcements")
-
-    if not data:
-        print("News API unavailable")
-        return
-
-    items = (
-        data.get("items", [])
-        if isinstance(data, dict)
-        else []
-    )
-
-    positive = [
-        "listing",
-        "launch",
-        "partnership",
-        "upgrade",
-        "mainnet",
-        "integration",
-        "support"
-    ]
-
-    negative = [
-        "delist",
-        "suspend",
-        "maintenance",
-        "withdrawal suspended",
-        "deposit suspended"
-    ]
-
-    for item in items[:20]:
-        title = item.get("title", "")
-        url = item.get("url", "")
-
-        key = str(
-            item.get("annId") or title
-        )
-
-        if key in state["alerts"]:
-            continue
-
-        lower = title.lower()
-
-        if any(word in lower for word in positive):
-            sent = telegram(
-                "📰 <b>KuCoin Positive News Watch</b>\n\n"
-                f"{title}\n{url}"
-            )
-
-            if sent:
-                state["alerts"].append(key)
-
-        elif any(word in lower for word in negative):
-            sent = telegram(
-                "⚠️ <b>KuCoin Important Announcement</b>\n\n"
-                f"{title}\n{url}"
-            )
-
-            if sent:
-                state["alerts"].append(key)
-
-
-def daily_report(results, state):
-    today = datetime.now(
-        timezone.utc
-    ).date().isoformat()
-
-    if state.get("daily_report") == today:
-        return
-
-    top = sorted(
-        results,
-        key=lambda x: x["score"],
-        reverse=True
-    )[:10]
-
-    if not top:
-        message = (
-            "📊 <b>Daily Deposit-OFF Watchlist</b>\n\n"
-            "আজ কোনো শক্তিশালী signal পাওয়া যায়নি।"
-        )
+    except Exception as e:
+        print(f"Error sending Telegram message: {e}")
 
     else:
-        message = (
-            "📊 <b>Daily Deposit-OFF Watchlist</b>\n\n"
+        await asyncio.sleep(1)
+
+
+async def send_donation_message(interval=60 * 60 + 15):
+    while True:
+        message = f"""💚 Help us push the boundaries of AI-driven analysis! Your contributions fuel our relentless pursuit of innovative trading strategies:
+
+🤲 <b>Every donation propels us forward.</b>
+
+<b>$USDT (TRC-20):</b>
+TGpiWetnYK2VQpxNGPR27D9vfM6Mei5vNA
+
+🫶 <b>Designed to help you.</b>
+🫶 <b>From AIs to human-beans.</b>
+
+🔸 <i>Version 2.0.1 (2024/06/29)</i>⠀"""
+
+        print(message)
+        await send_telegram_message(CHANNEL_ID, message)
+        await asyncio.sleep(interval)
+
+
+def calculate_variation_and_trend(prices_history, minutes_to_evaluate=5, hours_for_trend=4):
+    current_time = datetime.now()
+    variations = {}
+
+    evaluation_period = minutes_to_evaluate
+    trend_period = hours_for_trend * 60
+
+    for pair, prices in prices_history.items():
+        prices_in_evaluation_period = [
+            (price, time) for price, time in prices
+            if current_time - time <= timedelta(minutes=evaluation_period)
+        ]
+
+        trend_start_time = current_time - timedelta(
+            minutes=(evaluation_period + trend_period)
         )
 
-        for item in top:
-            message += (
-                f"• <b>{item['symbol']}</b>\n"
-                f"Score: {item['score']}/100\n"
-                f"Price change: {item['change']:.2f}%\n"
-                f"Volume: {item['volume_ratio']:.2f}x\n"
-                f"RSI: {item['rsi']:.1f}\n\n"
+        prices_in_trend_period = [
+            (price, time) for price, time in prices
+            if trend_start_time <= time <= trend_start_time + timedelta(minutes=trend_period)
+        ]
+
+        if len(prices_in_evaluation_period) >= 1 and len(prices_in_trend_period) >= 1:
+            initial_price_evaluation = prices_in_evaluation_period[0][0]
+            final_price_evaluation = prices_in_evaluation_period[-1][0]
+
+            initial_price_trend = prices_in_trend_period[0][0]
+            final_price_trend = prices_in_trend_period[-1][0]
+
+            variation_evaluation = (
+                (final_price_evaluation - initial_price_evaluation)
+                / initial_price_evaluation
+            ) * 100
+
+            variation_trend = (
+                (final_price_trend - initial_price_trend)
+                / initial_price_trend
+            ) * 100
+
+            if variation_evaluation > 0 and variation_trend > 0:
+                variations[pair] = variation_evaluation
+
+    return variations
+
+
+async def monitor_prices():
+    prices_history = {}
+    last_indicators = {}
+    sold_pairs = {}
+    monitoring_message_sent = False
+
+    while True:
+        data = fetch_market_data()
+
+        if data:
+            tickers = data["data"]["ticker"]
+
+            for ticker in tickers:
+                symbol = ticker["symbol"]
+
+                if "USDT" in symbol and not any(
+                    x in symbol for x in [
+                        "UP-", "DOWN-", "3L-", "3S-", "2L-", "2S-"
+                    ]
+                ):
+                    last_price = ticker.get("last")
+
+                    if last_price:
+                        price = float(last_price)
+
+                        if symbol not in prices_history:
+                            prices_history[symbol] = []
+
+                        prices_history[symbol].append((price, datetime.now()))
+
+            for pair in list(prices_history.keys()):
+                if len(prices_history[pair]) > 1000:
+                    prices_history[pair] = prices_history[pair][-1000:]
+
+            indicators = calculate_indicators(
+                prices_history, minutes_to_evaluate=5, hours_for_trend=4
             )
 
-    if telegram(message):
-        state["daily_report"] = today
-
-
-def main():
-    state = load_state()
-
-    print("Starting KuCoin Smart Scanner...")
-
-    if not TOKEN or not CHAT_ID:
-        print("Telegram secrets missing!")
-        return
-
-    off_coins = deposit_off_currencies()
-    tickers = get_tickers()
-
-    if not off_coins or not tickers:
-        print("Currency or ticker data unavailable.")
-        return
-
-    candidates = []
-
-    for ticker in tickers:
-        symbol = ticker.get("symbol", "")
-
-        if not symbol.endswith("-USDT"):
-            continue
-
-        coin = symbol.split("-")[0]
-
-        if coin not in off_coins:
-            continue
-
-        try:
-            change = (
-                float(ticker.get("changeRate", 0)) * 100
+            variations = calculate_variation_and_trend(
+                prices_history, minutes_to_evaluate=5, hours_for_trend=4
             )
 
-            volume = float(
-                ticker.get("volValue", 0)
-            )
+            any_signal = False
 
-            if (
-                -8 <= change < MAX_PRICE_CHANGE
-                and volume > 0
-            ):
-                candidates.append(
-                    (symbol, volume)
-                )
+            for pair, pair_indicators in indicators.items():
+                rsi_evaluation = pair_indicators["rsi_evaluation"]
+                rsi_trend = pair_indicators["rsi_trend"]
 
-        except Exception:
-            continue
+                macd_evaluation = pair_indicators["macd_evaluation"]
+                macd_trend = pair_indicators["macd_trend"]
 
-    candidates.sort(
-        key=lambda x: x[1],
-        reverse=True
-    )
+                signal_evaluation = pair_indicators["signal_evaluation"]
+                signal_trend = pair_indicators["signal_trend"]
 
-    candidates = candidates[:MAX_COINS]
+                hist_evaluation = pair_indicators["hist_evaluation"]
+                hist_trend = pair_indicators["hist_trend"]
 
-    print("Candidates:", len(candidates))
+                current_price = prices_history[pair][-1][0]
 
-    results = []
+                variation = (
+                    (current_price - prices_history[pair][0][0])
+                    / prices_history[pair][0][0]
+                ) * 100
 
-    for symbol, _ in candidates:
-        result = analyze(symbol)
+                if (
+                    rsi_evaluation > 45
+                    and macd_evaluation > signal_evaluation
+                    and hist_evaluation > 0
+                    and rsi_trend > 45
+                    and macd_trend > signal_trend
+                    and hist_trend > 0
+                    and pair not in sold_pairs
+                    and pair in variations
+                    and variations[pair] > 2
+                ):
+                    message = f"""🟢️ <b>STRONG PUMP DETECTED</b> 🟢️
 
-        if not result:
-            continue
+🧧 <b>${pair}</b>
 
-        results.append(result)
+🐋 <b>Price:</b> {current_price:.8f} $USDT
 
-        key = (
-            result["symbol"]
-            + "_"
-            + result["signal"]
-            + "_"
-            + str(datetime.now(timezone.utc).date())
-        )
+📈 <b>Variation:</b> {variation:.2f}%
 
-        if key not in state["alerts"]:
-            message = (
-                f"🚨 <b>{result['signal']}</b>\n\n"
-                f"Coin: <b>{result['symbol']}</b>\n"
-                f"Price: {result['price']}\n"
-                f"3h Change: {result['change']:.2f}%\n"
-                f"Volume: {result['volume_ratio']:.2f}x\n"
-                f"RSI: {result['rsi']:.1f}\n"
-                f"Buy ratio: {result['buy_ratio']:.2f}\n"
-                f"Bid ratio: {result['bid_ratio']:.2f}\n"
-                f"Score: {result['score']}/100\n\n"
-                f"Reasons: {', '.join(result['reasons'])}\n\n"
-                "⚠️ Research alert, not a guaranteed buy signal."
-            )
+🏄‍♂️ RSI, MACD, and Histogram indicate strong upward momentum
 
-            if telegram(message):
-                state["alerts"].append(key)
+💠 This is an excellent buying opportunity!⠀"""
 
-        time.sleep(0.25)
+                    print(message)
+                    await send_telegram_message(CHANNEL_ID, message)
 
-    news_alert(state)
-    daily_report(results, state)
+                    sold_pairs[pair] = True
+                    any_signal = True
 
-    state["alerts"] = state["alerts"][-2000:]
+                elif pair in sold_pairs and (
+                    (rsi_evaluation > 90 and variation < -3)
+                    or (
+                        rsi_evaluation > 90
+                        and macd_evaluation < signal_evaluation
+                        and macd_trend < signal_trend
+                    )
+                ):
+                    message = f"""🔴 <b>MOMENTUM DUMPING BELOW</b> 🔴
 
-    save_state(state)
+🧧 <b>${pair}</b>
 
-    print("Scanner finished.")
+🦈 <b>Price:</b> {current_price:.8f} $USDT
+
+📉 <b>Variation:</b> {variation:.2f}%
+
+🏄‍♀️ RSI, MACD, and Histogram indicate weakening upward momentum
+
+💠 Consider selling to mitigate risk!⠀"""
+
+                    print(message)
+                    await send_telegram_message(CHANNEL_ID, message)
+
+                    del sold_pairs[pair]
+                    any_signal = True
+
+            if not any_signal and not monitoring_message_sent:
+                message = """📊 <b>MONITORING FOR PUMP ENTRIES</b> 📊
+
+🏄 Once an optimal wave pattern emerges
+
+🔔 You'll be instantly notified to ride the momentum...⠀"""
+
+                print(message)
+                await send_telegram_message(CHANNEL_ID, message)
+                monitoring_message_sent = True
+
+        else:
+            print("Error fetching market data.")
+
+        await asyncio.sleep(1)
+
+
+async def main():
+    donation_task = asyncio.create_task(send_donation_message())
+    monitor_task = asyncio.create_task(monitor_prices())
+    await asyncio.gather(donation_task, monitor_task)
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
